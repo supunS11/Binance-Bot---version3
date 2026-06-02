@@ -67,6 +67,28 @@ def apply_indicators(df):
         df['volume_sma'] = df['volume'].rolling(20).mean()
 
         # =========================
+        # Add ATR
+        # =========================
+        high_low = df['high'] - df['low']
+
+        high_close = (
+            df['high'] -
+            df['close'].shift()
+        ).abs()
+
+        low_close = (
+            df['low'] -
+            df['close'].shift()
+        ).abs()
+
+        tr = pd.concat(
+            [high_low, high_close, low_close],
+            axis=1
+        ).max(axis=1)
+
+        df['atr'] = tr.rolling(14).mean()
+
+        # =========================
         # CLEANUP
         # =========================
         df.dropna(inplace=True)

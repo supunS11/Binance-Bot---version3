@@ -2,7 +2,7 @@ from logger import log_info, log_error
 from ai_model import ai_confidence_boost
 
 
-def score_to_confidence(score, max_score=13):
+def score_to_confidence(score, max_score=15):
 
     if score <= 0:
         return 0
@@ -13,7 +13,7 @@ def score_to_confidence(score, max_score=13):
     return round(min(confidence, 100), 2)
 
 
-def check_signal(trend_df, confirm_df, entry_df):
+def check_signal(trend_df, confirm_df, entry_df, btc_trend, btc_corr, rs):
 
     try:
 
@@ -24,6 +24,27 @@ def check_signal(trend_df, confirm_df, entry_df):
         support = trend_df['low'].rolling(50).min().iloc[-1]
         resistance = trend_df['high'].rolling(50).max().iloc[-1]
         price = trend_df['close'].iloc[-1]
+
+        atr_pct = (
+            entry['atr']
+            / entry['close']
+        ) * 100
+
+        log_info(
+            f"ATR%: {round(atr_pct, 2)}"
+        )
+
+        # ======================
+        # ATR VOLATILITY FILTER
+        # ======================
+
+        if atr_pct < 0.2 or atr_pct > 3.0:
+
+            log_info(
+                f"ATR FILTER BLOCKED | ATR%: {round(atr_pct, 2)}"
+            )
+
+            return None
 
         ema_gap_pct = (
             (trend['ema50'] - trend['ema200'])
@@ -104,6 +125,17 @@ def check_signal(trend_df, confirm_df, entry_df):
 
         if entry['close'] > entry['open']:
             buy_score += 1
+
+        if btc_corr >= 0.60:
+
+            if btc_trend == "BULLISH":
+                buy_score += 2
+
+            elif btc_trend == "BEARISH":
+                buy_score -= 2
+
+        if rs > 2:
+            buy_score += 2
 
         # ======================
         # REVERSAL DETECTION BUY
@@ -207,6 +239,17 @@ def check_signal(trend_df, confirm_df, entry_df):
 
         if entry['close'] < entry['open']:
             sell_score += 1
+
+        if btc_corr >= 0.60:
+
+            if btc_trend == "BEARISH":
+                sell_score += 2
+
+            elif btc_trend == "BULLISH":
+                sell_score -= 2
+
+        if rs < -2:
+            sell_score += 2
 
         # ======================
         # REVERSAL DETECTION SELL

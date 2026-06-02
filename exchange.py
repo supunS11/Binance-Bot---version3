@@ -6,6 +6,9 @@ import time
 
 import config
 
+import numpy as np
+from indicators import apply_indicators
+
 from logger import *
 
 
@@ -650,3 +653,133 @@ def setup_leverage(symbol):
         )
 
         return False
+ 
+def get_btc_correlation(symbol):
+
+    try:
+
+        if symbol == "BTCUSDT":
+            return 1.0
+
+        coin_df = get_klines(
+            symbol,
+            config.TREND_TIMEFRAME,
+            limit=100
+        )
+
+        btc_df = get_klines(
+            "BTCUSDT",
+            config.TREND_TIMEFRAME,
+            limit=100
+        )
+
+        if (
+            coin_df is None or
+            btc_df is None
+        ):
+            return 0
+
+        coin_returns = (
+            coin_df['close']
+            .pct_change()
+            .dropna()
+        )
+
+        btc_returns = (
+            btc_df['close']
+            .pct_change()
+            .dropna()
+        )
+
+        correlation = np.corrcoef(
+            coin_returns,
+            btc_returns
+        )[0, 1]
+
+        return round(
+            float(correlation),
+            2
+        )
+
+    except Exception as e:
+
+        log_error(
+            f"{symbol} correlation error: {e}"
+        )
+
+        return 0  
+
+def get_btc_trend():
+
+    try:
+
+        btc_df = get_klines(
+            "BTCUSDT",
+            config.TREND_TIMEFRAME
+        )
+
+        btc_df = apply_indicators(
+            btc_df
+        )
+
+        btc = btc_df.iloc[-2]
+
+        if btc['ema50'] > btc['ema200']:
+            return "BULLISH"
+
+        elif btc['ema50'] < btc['ema200']:
+            return "BEARISH"
+
+        return "NEUTRAL"
+
+    except Exception as e:
+
+        log_error(
+            f"BTC trend error: {e}"
+        )
+
+        return None 
+    
+def get_relative_strength(symbol):
+
+    try:
+
+        if symbol == "BTCUSDT":
+            return 0
+
+        coin_df = get_klines(
+            symbol,
+            config.TREND_TIMEFRAME,
+            limit=50
+        )
+
+        btc_df = get_klines(
+            "BTCUSDT",
+            config.TREND_TIMEFRAME,
+            limit=50
+        )
+
+        if coin_df is None or btc_df is None:
+            return 0
+
+        coin_return = (
+            coin_df['close'].iloc[-1]
+            - coin_df['close'].iloc[-10]
+        ) / coin_df['close'].iloc[-10] * 100
+
+        btc_return = (
+            btc_df['close'].iloc[-1]
+            - btc_df['close'].iloc[-10]
+        ) / btc_df['close'].iloc[-10] * 100
+
+        relative_strength = coin_return - btc_return
+
+        return round(relative_strength, 2)
+
+    except Exception as e:
+
+        log_error(
+            f"{symbol} RS ERROR: {e}"
+        )
+
+        return 0

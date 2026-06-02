@@ -16,7 +16,10 @@ from exchange import (
     setup_leverage,
     get_entry_price,
     get_margin_balance,
-    get_unrealized_pnl
+    get_unrealized_pnl,
+    get_btc_trend,
+    get_btc_correlation,
+    get_relative_strength
 )
 
 from indicators import apply_indicators
@@ -103,9 +106,34 @@ def run_bot():
                         continue
 
                     # =========================
+                    # BTC CORRELATION
+                    # =========================
+                    btc_trend = get_btc_trend()
+
+                    btc_corr = get_btc_correlation(
+                        symbol
+                    )
+
+                    log_info(
+                        f"{symbol} BTC CORR: "
+                        f"{btc_corr}"
+                    )
+
+                    log_info(
+                        f"BTC TREND: "
+                        f"{btc_trend}"
+                    )
+
+                    rs = get_relative_strength(symbol)
+
+                    log_info(
+                        f"{symbol} RELATIVE STRENGTH: {rs}%"
+                    )
+
+                    # =========================
                     # SIGNAL
                     # =========================
-                    signal = check_signal(trend_df, confirm_df, entry_df)
+                    signal = check_signal(trend_df, confirm_df, entry_df, btc_trend, btc_corr, rs)
 
                     if not signal:
                         log_warning(f"{symbol} NO SIGNAL FOUND")
