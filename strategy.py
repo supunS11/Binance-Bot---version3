@@ -1,3 +1,4 @@
+import config
 from logger import log_info, log_error
 from ai_model import ai_confidence_boost
 
@@ -148,12 +149,17 @@ def check_signal(trend_df, confirm_df, entry_df, btc_trend, btc_corr, rs):
             for i in range(1, 4)
         )
 
+        required_distance = (
+            config.ROI_PERCENT_TP /
+            config.LEVERAGE
+        ) + 0.7
+
         if (
             trend['ema50'] > trend['ema200'] and
             bullish_ema_rejection and
             trend['close'] > trend['ema50'] and
             0.5 < ema_gap_pct < 8 and
-            resistance_distance > 2
+            resistance_distance > required_distance
         ):
             buy_score += 2
 
@@ -242,7 +248,7 @@ def check_signal(trend_df, confirm_df, entry_df, btc_trend, btc_corr, rs):
             bearish_ema_rejection and
             trend['close'] < trend['ema50'] and
             -8 < ema_gap_pct < -0.5 and
-            support_distance > 2
+            support_distance > required_distance
         ):
             sell_score += 2
 

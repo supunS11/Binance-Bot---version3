@@ -20,7 +20,7 @@ def ai_confidence_boost(trend_df, confirm_df, entry_df, signal, btc_trend=None, 
         required_distance = (
             config.ROI_PERCENT_TP /
             config.LEVERAGE
-        ) + 0.5
+        ) + 0.7
 
         # ======================
         # ADX FILTER (IMPROVED ALIGNMENT)
