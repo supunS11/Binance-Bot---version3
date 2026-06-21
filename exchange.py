@@ -11,12 +11,60 @@ from logger import log_info, log_warning, log_error
 
 
 client = Client(config.API_KEY, config.SECRET_KEY)
+_exchange_info_cache = None
+_last_kline_request_at = 0.0
 
 # =========================
 # SYNC TIME
 # =========================
 server_time = client.get_server_time()
 client.timestamp_offset = server_time['serverTime'] - int(time.time() * 1000)
+
+
+def _throttle_kline_request():
+    global _last_kline_request_at
+
+    delay = getattr(config, "REQUEST_THROTTLE_SECONDS", 0)
+
+    if delay <= 0:
+        return
+
+    elapsed = time.time() - _last_kline_request_at
+
+    if elapsed < delay:
+        time.sleep(delay - elapsed)
+
+    _last_kline_request_at = time.time()
+
+
+def get_exchange_info():
+    global _exchange_info_cache
+
+    if _exchange_info_cache is None:
+        _exchange_info_cache = client.futures_exchange_info()
+
+    return _exchange_info_cache
+
+
+def get_supported_symbols():
+
+    try:
+        symbols = set()
+
+        for item in get_exchange_info().get("symbols", []):
+            if item.get("status") != "TRADING":
+                continue
+
+            if item.get("contractType") != "PERPETUAL":
+                continue
+
+            symbols.add(item["symbol"])
+
+        return symbols
+
+    except Exception as e:
+        log_error(f"supported symbols error: {e}")
+        return set()
 
 
 # =========================
@@ -31,10 +79,15 @@ def set_margin_type(symbol):
         )
 
         log_info(f"{symbol} Margin: {config.MARGIN_TYPE}")
+        return True
 
     except Exception as e:
         if "No need to change margin type" not in str(e):
             log_warning(str(e))
+            return False
+
+        log_info(f"{symbol} Margin already {config.MARGIN_TYPE}")
+        return True
 
 
 # =========================
@@ -88,9 +141,11 @@ def get_unrealized_pnl():
 # =========================
 # KLINES
 # =========================
-def get_klines(symbol, interval, limit=500):
+def get_klines(symbol, interval, limit=None):
 
     try:
+        limit = limit if limit is not None else config.KLINE_LIMIT
+        _throttle_kline_request()
 
         klines = client.futures_klines(
             symbol=symbol,
@@ -148,17 +203,38 @@ def is_position_closed(symbol):
         return False
 
 
-def get_open_position_counts():
+def get_open_positions():
+
+    try:
+        positions = client.futures_position_information()
+        open_positions = {}
+
+        for p in positions:
+            amount = float(p["positionAmt"])
+
+            if amount != 0:
+                open_positions[p["symbol"]] = amount
+
+        return open_positions
+
+    except Exception as e:
+        log_error(f"open positions error: {e}")
+        return None
+
+
+def get_open_position_counts(open_positions=None):
 
     try:
 
-        positions = client.futures_position_information()
+        if open_positions is None:
+            open_positions = get_open_positions()
+
+        if open_positions is None:
+            return {"total": 0, "buy": 0, "sell": 0}
 
         total = buy = sell = 0
 
-        for p in positions:
-
-            amt = float(p['positionAmt'])
+        for amt in open_positions.values():
 
             if amt == 0:
                 continue
@@ -186,7 +262,7 @@ def get_open_position_counts():
 # =========================
 def get_symbol_precision(symbol):
 
-    info = client.futures_exchange_info()
+    info = get_exchange_info()
 
     for s in info['symbols']:
         if s['symbol'] == symbol:
@@ -197,7 +273,7 @@ def get_symbol_precision(symbol):
 
 def get_price_precision(symbol):
 
-    info = client.futures_exchange_info()
+    info = get_exchange_info()
 
     for s in info['symbols']:
         if s['symbol'] == symbol:
@@ -209,13 +285,41 @@ def get_price_precision(symbol):
 # =========================
 # ENTRY PRICE
 # =========================
-def get_entry_price(symbol):
+def get_entry_price(symbol, order=None):
 
-    time.sleep(2)
+    if order:
+        avg_price = float(order.get("avgPrice", 0) or 0)
 
-    positions = client.futures_position_information(symbol=symbol)
+        if avg_price <= 0:
+            executed_qty = float(order.get("executedQty", 0) or 0)
+            cum_quote = float(order.get("cumQuote", 0) or 0)
 
-    return abs(float(positions[0]['entryPrice']))
+            if executed_qty > 0 and cum_quote > 0:
+                avg_price = cum_quote / executed_qty
+
+        if avg_price > 0:
+            return avg_price
+
+    last_error = None
+
+    for attempt in range(config.ENTRY_PRICE_RETRIES):
+        try:
+            positions = client.futures_position_information(symbol=symbol)
+            entry_price = abs(float(positions[0]["entryPrice"]))
+
+            if entry_price > 0:
+                return entry_price
+
+        except Exception as e:
+            last_error = e
+
+        if attempt < config.ENTRY_PRICE_RETRIES - 1:
+            time.sleep(config.ENTRY_PRICE_RETRY_DELAY_SECONDS)
+
+    if last_error:
+        log_warning(f"{symbol} entry price polling error: {last_error}")
+
+    return 0
 
 
 # =========================
@@ -229,7 +333,8 @@ def place_market_order(symbol, side, quantity):
             symbol=symbol,
             side=side,
             type=FUTURE_ORDER_TYPE_MARKET,
-            quantity=quantity
+            quantity=quantity,
+            newOrderRespType="RESULT"
         )
 
         log_info(f"{symbol} MARKET ORDER: {side}")
@@ -270,9 +375,6 @@ def get_structure_stop_loss(df, side):
 def place_tp_sl(symbol, side, entry_price, quantity, confirm_df):
 
     try:
-
-        time.sleep(2)
-
         precision = get_price_precision(symbol)
 
         market_price = float(
@@ -280,17 +382,26 @@ def place_tp_sl(symbol, side, entry_price, quantity, confirm_df):
         )
 
         # ================= BUY =================
+        tp_roi = (
+            config.STATIC_TP_ROI
+            if getattr(config, "STATIC_TP_ENABLED", True)
+            else config.ROI_PERCENT_TP
+        )
+
         if side == SIDE_BUY:
 
             tp_price = round(
-                entry_price * (1 + (config.ROI_PERCENT_TP / config.LEVERAGE) / 100),
+                entry_price * (1 + (tp_roi / config.LEVERAGE) / 100),
                 precision
             )
 
-            sl_price = round(
-                get_structure_stop_loss(confirm_df, SIDE_BUY),
-                precision
-            )
+            sl_price = None
+
+            if config.SL_ENABLED:
+                sl_price = round(
+                    get_structure_stop_loss(confirm_df, SIDE_BUY),
+                    precision
+                )
 
             close_side = SIDE_SELL
 
@@ -298,27 +409,37 @@ def place_tp_sl(symbol, side, entry_price, quantity, confirm_df):
         else:
 
             tp_price = round(
-                entry_price * (1 - (config.ROI_PERCENT_TP / config.LEVERAGE) / 100),
+                entry_price * (1 - (tp_roi / config.LEVERAGE) / 100),
                 precision
             )
 
-            sl_price = round(
-                get_structure_stop_loss(confirm_df, SIDE_SELL),
-                precision
-            )
+            sl_price = None
+
+            if config.SL_ENABLED:
+                sl_price = round(
+                    get_structure_stop_loss(confirm_df, SIDE_SELL),
+                    precision
+                )
 
             close_side = SIDE_BUY
 
         # ================= VALIDATION ONLY =================
         if side == SIDE_BUY:
-            if tp_price <= market_price or sl_price >= market_price:
-                return
+            if tp_price <= market_price:
+                return False
+
+            if config.SL_ENABLED and sl_price >= market_price:
+                return False
         else:
-            if tp_price >= market_price or sl_price <= market_price:
-                return
+            if tp_price >= market_price:
+                return False
+
+            if config.SL_ENABLED and sl_price <= market_price:
+                return False
 
         log_info(
-            f"{symbol}\nENTRY: {entry_price}\nTP: {tp_price}\nSL: {sl_price}"
+            f"{symbol}\nENTRY: {entry_price}\nTP: {tp_price}\n"
+            f"SL: {sl_price if config.SL_ENABLED else 'DISABLED'}"
         )
 
         # TAKE PROFIT
@@ -332,23 +453,28 @@ def place_tp_sl(symbol, side, entry_price, quantity, confirm_df):
             priceProtect=True
         )
 
-        time.sleep(2)
+        if config.SL_ENABLED:
+            time.sleep(config.PROTECTION_ORDER_DELAY_SECONDS)
 
-        # STOP LOSS
-        client.futures_create_order(
-            symbol=symbol,
-            side=close_side,
-            type="STOP_MARKET",
-            stopPrice=sl_price,
-            closePosition=True,
-            workingType="MARK_PRICE",
-            priceProtect=True
-        )
+            # STOP LOSS
+            client.futures_create_order(
+                symbol=symbol,
+                side=close_side,
+                type="STOP_MARKET",
+                stopPrice=sl_price,
+                closePosition=True,
+                workingType="MARK_PRICE",
+                priceProtect=True
+            )
+        else:
+            log_warning(f"{symbol} SL DISABLED | CROSS-MARGIN LONG-TERM MODE")
 
-        log_info(f"{symbol} TP/SL CREATED")
+        log_info(f"{symbol} TP CREATED")
+        return True
 
     except Exception as e:
         log_error(f"{symbol} TP/SL error: {e}")
+        return False
 
 
 # =========================

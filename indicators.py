@@ -56,11 +56,11 @@ def apply_indicators(df):
         # =========================
         # ADX (FIXED - REAL VERSION)
         # =========================
-        plus_dm = high.diff()
-        minus_dm = low.diff().abs()
+        up_move = high.diff()
+        down_move = -low.diff()
 
-        plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
-        minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
 
         atr = df['atr']
 
