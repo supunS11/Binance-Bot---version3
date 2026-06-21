@@ -173,6 +173,36 @@ def _collect_ema_levels(df, side, label, timeframe_weight):
     return levels
 
 
+def _collect_range_levels(df, side, label, timeframe_weight):
+    lookback = get_config_int("LONG_TERM_SR_LOOKBACK", 160)
+    data = df.iloc[:-1].tail(lookback).copy() if len(df) > 1 else df.tail(lookback)
+
+    if len(data) < 20:
+        return []
+
+    tolerance = _level_tolerance(data)
+    column = "low" if side == "BUY" else "high"
+    levels = []
+
+    for window in (20, 50, 100):
+        if len(data) < window:
+            continue
+
+        recent = data.tail(window)
+        level = recent[column].min() if side == "BUY" else recent[column].max()
+        touches = int((abs(data[column] - level) <= tolerance).sum())
+        score = timeframe_weight + min(window / 100, 1) + (touches * 0.25)
+
+        levels.append({
+            "level": float(level),
+            "score": round(score, 2),
+            "touches": touches,
+            "source": f"{label}_{window}_range",
+        })
+
+    return levels
+
+
 def _dedupe_levels(levels, tolerance):
     deduped = []
 
@@ -183,6 +213,113 @@ def _dedupe_levels(levels, tolerance):
         deduped.append(level)
 
     return deduped
+
+
+def _take_profit_buffer(entry_price, trend_df, confirm_df):
+    pct_buffer = entry_price * (
+        get_config_float("STRUCTURE_TP_BUFFER_PCT", 0.15) / 100
+    )
+    atr_values = []
+
+    for df in (confirm_df, trend_df):
+        try:
+            atr = latest_closed(df)["atr"]
+
+            if atr > 0:
+                atr_values.append(float(atr))
+        except Exception:
+            continue
+
+    atr_buffer = 0
+
+    if atr_values:
+        atr_buffer = min(atr_values) * get_config_float(
+            "STRUCTURE_TP_ATR_BUFFER_MULT",
+            0.25
+        )
+
+    return max(pct_buffer, atr_buffer, entry_price * 0.0005)
+
+
+def find_structure_take_profit(side, entry_price, trend_df, confirm_df, leverage=None):
+    leverage_to_use = leverage or config.LEVERAGE
+    target_side = "SELL" if side == "BUY" else "BUY"
+    min_roi = get_config_float("STRUCTURE_TP_MIN_ROI", 8)
+    max_roi = get_config_float("STRUCTURE_TP_MAX_ROI", 120)
+    min_score = get_config_float("STRUCTURE_TP_MIN_SCORE", 2.0)
+    buffer = _take_profit_buffer(entry_price, trend_df, confirm_df)
+
+    candidates = []
+    candidates.extend(_collect_pivot_levels(trend_df, target_side, "1d", 2.0))
+    candidates.extend(_collect_pivot_levels(confirm_df, target_side, "4h", 1.25))
+    candidates.extend(_collect_range_levels(trend_df, target_side, "1d", 2.0))
+    candidates.extend(_collect_range_levels(confirm_df, target_side, "4h", 1.25))
+    candidates.extend(_collect_ema_levels(trend_df, target_side, "1d", 2.0))
+    candidates.extend(_collect_ema_levels(confirm_df, target_side, "4h", 1.25))
+
+    tolerance = max(_level_tolerance(trend_df), _level_tolerance(confirm_df))
+    candidates = _dedupe_levels(candidates, tolerance)
+    valid = []
+
+    for candidate in candidates:
+        level = candidate["level"]
+
+        if candidate["score"] < min_score:
+            continue
+
+        if side == "BUY":
+            if level <= entry_price:
+                continue
+
+            target_price = level - buffer
+
+            if target_price <= entry_price:
+                continue
+
+            roi = ((target_price - entry_price) / entry_price) * leverage_to_use * 100
+        else:
+            if level >= entry_price:
+                continue
+
+            target_price = level + buffer
+
+            if target_price >= entry_price:
+                continue
+
+            roi = ((entry_price - target_price) / entry_price) * leverage_to_use * 100
+
+        if roi < min_roi or roi > max_roi:
+            continue
+
+        item = candidate.copy()
+        item["target_price"] = float(target_price)
+        item["raw_level"] = float(level)
+        item["target_roi"] = round(float(roi), 2)
+        item["buffer"] = round(float(buffer), 8)
+        valid.append(item)
+
+    if not valid:
+        return None
+
+    valid.sort(key=lambda item: (item["target_roi"], -item["score"]))
+    return valid[0]
+
+
+def validate_structure_take_profit(side, entry_price, trend_df, confirm_df, leverage=None):
+    target = find_structure_take_profit(
+        side,
+        entry_price,
+        trend_df,
+        confirm_df,
+        leverage=leverage
+    )
+
+    if target:
+        return True, target
+
+    return False, {
+        "reason": "NO VALID STRUCTURE TP LEVEL FOUND"
+    }
 
 
 def find_adverse_zone_level(side, entry_price, trend_df, confirm_df, leverage=None):
@@ -394,7 +531,66 @@ def _btc_context_score(side, btc_trend, btc_corr, rs):
     return score
 
 
-def _side_signal_score(side, trend_df, confirm_df, entry_df, btc_trend, btc_corr, rs):
+def _futures_participation_score(side, participation):
+    if not participation or not participation.get("available"):
+        return 0
+
+    score = 0
+    oi_change = participation.get("oi_change_pct")
+    taker_ratio = participation.get("taker_buy_sell_ratio")
+    global_ratio = participation.get("global_long_short_ratio")
+    top_ratio = participation.get("top_long_short_ratio")
+    funding_rate = participation.get("funding_rate")
+    oi_min = get_config_float("FUTURES_CONTEXT_OI_MIN_CHANGE_PCT", 1.0)
+    taker_buy_min = get_config_float("FUTURES_CONTEXT_TAKER_BUY_MIN", 1.05)
+    taker_sell_max = get_config_float("FUTURES_CONTEXT_TAKER_SELL_MAX", 0.95)
+    crowd_long_max = get_config_float("FUTURES_CONTEXT_CROWD_LONG_MAX", 2.2)
+    crowd_short_min = get_config_float("FUTURES_CONTEXT_CROWD_SHORT_MIN", 0.45)
+    funding_abs_max = get_config_float("FUTURES_CONTEXT_FUNDING_ABS_MAX", 0.001)
+
+    if oi_change is not None:
+        score = add_score(score, oi_change >= oi_min, 1.5)
+        score -= 1 if oi_change <= -oi_min else 0
+
+    if taker_ratio is not None:
+        if side == "BUY":
+            score = add_score(score, taker_ratio >= taker_buy_min, 2)
+            score -= 2 if taker_ratio <= taker_sell_max else 0
+        else:
+            score = add_score(score, taker_ratio <= taker_sell_max, 2)
+            score -= 2 if taker_ratio >= taker_buy_min else 0
+
+    crowd_ratio = top_ratio if top_ratio is not None else global_ratio
+
+    if crowd_ratio is not None:
+        if side == "BUY":
+            score -= 1.5 if crowd_ratio >= crowd_long_max else 0
+            score = add_score(score, crowd_ratio <= 1, 0.5)
+        else:
+            score -= 1.5 if crowd_ratio <= crowd_short_min else 0
+            score = add_score(score, crowd_ratio >= 1, 0.5)
+
+    if funding_rate is not None:
+        if side == "BUY":
+            score -= 1 if funding_rate >= funding_abs_max else 0
+            score = add_score(score, funding_rate <= -funding_abs_max, 0.5)
+        else:
+            score -= 1 if funding_rate <= -funding_abs_max else 0
+            score = add_score(score, funding_rate >= funding_abs_max, 0.5)
+
+    return round(score, 2)
+
+
+def _side_signal_score(
+    side,
+    trend_df,
+    confirm_df,
+    entry_df,
+    btc_trend,
+    btc_corr,
+    rs,
+    participation=None
+):
     entry_price = latest_closed(entry_df)["close"]
     level_ok, level = validate_adverse_zone_level(
         side,
@@ -406,15 +602,30 @@ def _side_signal_score(side, trend_df, confirm_df, entry_df, btc_trend, btc_corr
     confirm_score, confirm_ok = _confirmation_score(side, confirm_df)
     entry_score, entry_ok, ema_distance = _entry_score(side, entry_df)
     btc_score = _btc_context_score(side, btc_trend, btc_corr, rs)
+    participation_score = _futures_participation_score(side, participation)
     level_score = 4 if level_ok else 0
 
-    total = trend_score + confirm_score + entry_score + btc_score + level_score
+    total = (
+        trend_score +
+        confirm_score +
+        entry_score +
+        btc_score +
+        level_score +
+        participation_score
+    )
     hard_ok = trend_ok and confirm_ok and entry_ok and level_ok
 
     return {
         "side": side,
         "score": max(0, total),
         "confidence": score_to_confidence(max(0, total)),
+        "base_score": trend_score + confirm_score + entry_score + btc_score + level_score,
+        "trend_score": trend_score,
+        "confirm_score": confirm_score,
+        "entry_score": entry_score,
+        "btc_score": btc_score,
+        "level_score": level_score,
+        "participation_score": participation_score,
         "hard_ok": hard_ok,
         "trend_ok": trend_ok,
         "confirm_ok": confirm_ok,
@@ -425,7 +636,81 @@ def _side_signal_score(side, trend_df, confirm_df, entry_df, btc_trend, btc_corr
     }
 
 
-def check_signal(trend_df, confirm_df, entry_df, btc_trend, btc_corr, rs):
+def _select_signal(buy, sell):
+    threshold = config.LONG_TERM_SIGNAL_THRESHOLD
+    min_edge = config.LONG_TERM_MIN_SIGNAL_EDGE
+
+    if (
+        buy["hard_ok"]
+        and buy["confidence"] >= threshold
+        and buy["confidence"] >= sell["confidence"] + min_edge
+    ):
+        return "BUY"
+
+    if (
+        sell["hard_ok"]
+        and sell["confidence"] >= threshold
+        and sell["confidence"] >= buy["confidence"] + min_edge
+    ):
+        return "SELL"
+
+    return None
+
+
+def log_signal_analysis(analysis):
+    buy = analysis["buy"]
+    sell = analysis["sell"]
+
+    log_info(
+        f"BUY conf={buy.get('confidence', 0)}% hard={buy.get('hard_ok', False)} "
+        f"level={buy.get('level_ok', False)} "
+        f"futures={buy.get('participation_score', 0)} | "
+        f"SELL conf={sell.get('confidence', 0)}% "
+        f"hard={sell.get('hard_ok', False)} "
+        f"level={sell.get('level_ok', False)} "
+        f"futures={sell.get('participation_score', 0)}"
+    )
+
+    if buy.get("level_ok"):
+        log_info(
+            f"BUY support {buy.get('level', {}).get('level')} "
+            f"ROI={buy.get('level', {}).get('adverse_roi')}% "
+            f"SRC={buy.get('level', {}).get('source')}"
+        )
+    else:
+        log_warning(
+            f"BUY BLOCKED | {buy.get('level', {}).get('reason', 'NO DETAILS')}"
+        )
+
+    if sell.get("level_ok"):
+        log_info(
+            f"SELL resistance {sell.get('level', {}).get('level')} "
+            f"ROI={sell.get('level', {}).get('adverse_roi')}% "
+            f"SRC={sell.get('level', {}).get('source')}"
+        )
+    else:
+        log_warning(
+            f"SELL BLOCKED | {sell.get('level', {}).get('reason', 'NO DETAILS')}"
+        )
+
+    if analysis["signal"]:
+        log_info(
+            f"FINAL LONG-TERM {analysis['signal']} "
+            f"CONFIDENCE: "
+            f"{analysis[analysis['signal'].lower()].get('confidence', 0)}"
+        )
+
+
+def analyze_signal(
+    trend_df,
+    confirm_df,
+    entry_df,
+    btc_trend,
+    btc_corr,
+    rs,
+    participation=None,
+    log_details=True
+):
     try:
         buy = _side_signal_score(
             "BUY",
@@ -434,7 +719,8 @@ def check_signal(trend_df, confirm_df, entry_df, btc_trend, btc_corr, rs):
             entry_df,
             btc_trend,
             btc_corr,
-            rs
+            rs,
+            participation=participation
         )
         sell = _side_signal_score(
             "SELL",
@@ -443,54 +729,64 @@ def check_signal(trend_df, confirm_df, entry_df, btc_trend, btc_corr, rs):
             entry_df,
             btc_trend,
             btc_corr,
-            rs
+            rs,
+            participation=participation
         )
-        threshold = config.LONG_TERM_SIGNAL_THRESHOLD
-        min_edge = config.LONG_TERM_MIN_SIGNAL_EDGE
+        signal = _select_signal(buy, sell)
+        best = buy if buy["confidence"] >= sell["confidence"] else sell
+        analysis = {
+            "buy": buy,
+            "sell": sell,
+            "signal": signal,
+            "best_side": best["side"],
+            "best_confidence": best["confidence"],
+            "threshold": config.LONG_TERM_SIGNAL_THRESHOLD,
+            "min_edge": config.LONG_TERM_MIN_SIGNAL_EDGE,
+            "participation_available": bool(
+                participation and participation.get("available")
+            ),
+        }
 
-        log_info(
-            f"BUY conf={buy['confidence']}% hard={buy['hard_ok']} "
-            f"level={buy['level_ok']} | "
-            f"SELL conf={sell['confidence']}% hard={sell['hard_ok']} "
-            f"level={sell['level_ok']}"
-        )
+        if log_details:
+            log_signal_analysis(analysis)
 
-        if buy["level_ok"]:
-            log_info(
-                f"BUY support {buy['level']['level']} "
-                f"ROI={buy['level']['adverse_roi']}% "
-                f"SRC={buy['level']['source']}"
-            )
-        else:
-            log_warning(f"BUY BLOCKED | {buy['level']['reason']}")
-
-        if sell["level_ok"]:
-            log_info(
-                f"SELL resistance {sell['level']['level']} "
-                f"ROI={sell['level']['adverse_roi']}% "
-                f"SRC={sell['level']['source']}"
-            )
-        else:
-            log_warning(f"SELL BLOCKED | {sell['level']['reason']}")
-
-        if (
-            buy["hard_ok"]
-            and buy["confidence"] >= threshold
-            and buy["confidence"] >= sell["confidence"] + min_edge
-        ):
-            log_info(f"FINAL LONG-TERM BUY CONFIDENCE: {buy['confidence']}")
-            return "BUY"
-
-        if (
-            sell["hard_ok"]
-            and sell["confidence"] >= threshold
-            and sell["confidence"] >= buy["confidence"] + min_edge
-        ):
-            log_info(f"FINAL LONG-TERM SELL CONFIDENCE: {sell['confidence']}")
-            return "SELL"
-
-        return None
+        return analysis
 
     except Exception as e:
         log_error(f"STRATEGY ERROR: {e}")
-        return None
+        return {
+            "buy": {},
+            "sell": {},
+            "signal": None,
+            "best_side": None,
+            "best_confidence": 0,
+            "threshold": config.LONG_TERM_SIGNAL_THRESHOLD,
+            "min_edge": config.LONG_TERM_MIN_SIGNAL_EDGE,
+            "participation_available": False,
+            "error": str(e),
+        }
+
+
+def should_fetch_futures_context(analysis):
+    if not config.FUTURES_CONTEXT_ENABLED:
+        return False
+
+    if analysis.get("best_confidence", 0) < config.FUTURES_CONTEXT_MIN_CONFIDENCE:
+        return False
+
+    buy = analysis.get("buy", {})
+    sell = analysis.get("sell", {})
+
+    return bool(buy.get("level_ok") or sell.get("level_ok"))
+
+
+def check_signal(trend_df, confirm_df, entry_df, btc_trend, btc_corr, rs):
+    return analyze_signal(
+        trend_df,
+        confirm_df,
+        entry_df,
+        btc_trend,
+        btc_corr,
+        rs,
+        log_details=True
+    )["signal"]

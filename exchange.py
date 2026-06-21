@@ -13,6 +13,7 @@ from logger import log_info, log_warning, log_error
 client = Client(config.API_KEY, config.SECRET_KEY)
 _exchange_info_cache = None
 _last_kline_request_at = 0.0
+_futures_context_cache = {}
 
 # =========================
 # SYNC TIME
@@ -65,6 +66,124 @@ def get_supported_symbols():
     except Exception as e:
         log_error(f"supported symbols error: {e}")
         return set()
+
+
+def _to_float(value, default=None):
+    try:
+        if value in (None, ""):
+            return default
+
+        return float(value)
+
+    except (TypeError, ValueError):
+        return default
+
+
+def _latest_item(items):
+    if not items:
+        return None
+
+    return items[-1]
+
+
+def _change_pct(items, field):
+    if not items or len(items) < 2:
+        return None
+
+    first = _to_float(items[0].get(field))
+    last = _to_float(items[-1].get(field))
+
+    if not first:
+        return None
+
+    return round(((last - first) / first) * 100, 2)
+
+
+def get_futures_participation(symbol):
+    if not config.FUTURES_CONTEXT_ENABLED:
+        return {"available": False, "reason": "DISABLED"}
+
+    key = (
+        symbol,
+        config.FUTURES_CONTEXT_PERIOD,
+        config.FUTURES_CONTEXT_LIMIT
+    )
+    cached = _futures_context_cache.get(key)
+
+    if cached and time.time() - cached["time"] <= config.FUTURES_CONTEXT_CACHE_SECONDS:
+        return cached["data"]
+
+    period = config.FUTURES_CONTEXT_PERIOD
+    limit = config.FUTURES_CONTEXT_LIMIT
+    params = {"symbol": symbol, "period": period, "limit": limit}
+    data = {
+        "available": True,
+        "symbol": symbol,
+        "period": period,
+        "limit": limit,
+        "oi_change_pct": None,
+        "taker_buy_sell_ratio": None,
+        "global_long_short_ratio": None,
+        "top_long_short_ratio": None,
+        "funding_rate": None,
+        "errors": [],
+    }
+
+    try:
+        oi_hist = client.futures_open_interest_hist(**params)
+        data["oi_change_pct"] = _change_pct(oi_hist, "sumOpenInterest")
+    except Exception as e:
+        data["errors"].append(f"OI:{e}")
+
+    try:
+        taker = _latest_item(client.futures_taker_longshort_ratio(**params))
+        data["taker_buy_sell_ratio"] = _to_float(
+            taker.get("buySellRatio") if taker else None
+        )
+    except Exception as e:
+        data["errors"].append(f"TAKER:{e}")
+
+    try:
+        global_ratio = _latest_item(client.futures_global_longshort_ratio(**params))
+        data["global_long_short_ratio"] = _to_float(
+            global_ratio.get("longShortRatio") if global_ratio else None
+        )
+    except Exception as e:
+        data["errors"].append(f"GLOBAL_LS:{e}")
+
+    try:
+        top_ratio = _latest_item(client.futures_top_longshort_position_ratio(**params))
+        data["top_long_short_ratio"] = _to_float(
+            top_ratio.get("longShortRatio") if top_ratio else None
+        )
+    except Exception as e:
+        data["errors"].append(f"TOP_LS:{e}")
+
+    try:
+        premium = client.futures_mark_price(symbol=symbol)
+        data["funding_rate"] = _to_float(premium.get("lastFundingRate"))
+    except Exception as e:
+        data["errors"].append(f"FUNDING:{e}")
+
+    usable_values = [
+        data["oi_change_pct"],
+        data["taker_buy_sell_ratio"],
+        data["global_long_short_ratio"],
+        data["top_long_short_ratio"],
+        data["funding_rate"],
+    ]
+
+    data["available"] = any(value is not None for value in usable_values)
+
+    if data["errors"]:
+        log_warning(f"{symbol} futures context partial: {' | '.join(data['errors'])}")
+
+    _futures_context_cache[key] = {
+        "time": time.time(),
+        "data": data
+    }
+
+    return data
 
 
 # =========================
@@ -369,10 +488,30 @@ def get_structure_stop_loss(df, side):
         return None
 
 
+def get_roi_take_profit(side, entry_price, roi, precision):
+    if side == SIDE_BUY:
+        return round(
+            entry_price * (1 + (roi / config.LEVERAGE) / 100),
+            precision
+        )
+
+    return round(
+        entry_price * (1 - (roi / config.LEVERAGE) / 100),
+        precision
+    )
+
+
+def is_valid_take_profit(side, tp_price, market_price):
+    if side == SIDE_BUY:
+        return tp_price > market_price
+
+    return tp_price < market_price
+
+
 # =========================
 # TP/SL EXECUTION (CLEAN VERSION)
 # =========================
-def place_tp_sl(symbol, side, entry_price, quantity, confirm_df):
+def place_tp_sl(symbol, side, entry_price, quantity, confirm_df, structure_tp=None):
 
     try:
         precision = get_price_precision(symbol)
@@ -381,20 +520,7 @@ def place_tp_sl(symbol, side, entry_price, quantity, confirm_df):
             client.futures_mark_price(symbol=symbol)['markPrice']
         )
 
-        # ================= BUY =================
-        tp_roi = (
-            config.STATIC_TP_ROI
-            if getattr(config, "STATIC_TP_ENABLED", True)
-            else config.ROI_PERCENT_TP
-        )
-
         if side == SIDE_BUY:
-
-            tp_price = round(
-                entry_price * (1 + (tp_roi / config.LEVERAGE) / 100),
-                precision
-            )
-
             sl_price = None
 
             if config.SL_ENABLED:
@@ -407,12 +533,6 @@ def place_tp_sl(symbol, side, entry_price, quantity, confirm_df):
 
         # ================= SELL =================
         else:
-
-            tp_price = round(
-                entry_price * (1 - (tp_roi / config.LEVERAGE) / 100),
-                precision
-            )
-
             sl_price = None
 
             if config.SL_ENABLED:
@@ -423,22 +543,57 @@ def place_tp_sl(symbol, side, entry_price, quantity, confirm_df):
 
             close_side = SIDE_BUY
 
-        # ================= VALIDATION ONLY =================
-        if side == SIDE_BUY:
-            if tp_price <= market_price:
-                return False
-
-            if config.SL_ENABLED and sl_price >= market_price:
-                return False
+        if config.STATIC_TP_ENABLED:
+            tp_mode = f"STATIC_ROI_{config.STATIC_TP_ROI}%"
+            tp_price = get_roi_take_profit(
+                side,
+                entry_price,
+                config.STATIC_TP_ROI,
+                precision
+            )
+        elif structure_tp and structure_tp.get("target_price"):
+            tp_mode = (
+                f"STRUCTURE_{structure_tp['source']} "
+                f"ROI={structure_tp['target_roi']}%"
+            )
+            tp_price = round(structure_tp["target_price"], precision)
         else:
-            if tp_price >= market_price:
-                return False
+            tp_mode = f"FALLBACK_ROI_{config.STRUCTURE_TP_FALLBACK_ROI}%"
+            tp_price = get_roi_take_profit(
+                side,
+                entry_price,
+                config.STRUCTURE_TP_FALLBACK_ROI,
+                precision
+            )
 
-            if config.SL_ENABLED and sl_price <= market_price:
-                return False
+        if (
+            not config.STATIC_TP_ENABLED
+            and structure_tp
+            and structure_tp.get("target_price")
+            and not is_valid_take_profit(side, tp_price, market_price)
+        ):
+            log_warning(f"{symbol} STRUCTURE TP INVALID | USING FALLBACK ROI")
+            tp_mode = f"FALLBACK_ROI_{config.STRUCTURE_TP_FALLBACK_ROI}%"
+            tp_price = get_roi_take_profit(
+                side,
+                entry_price,
+                config.STRUCTURE_TP_FALLBACK_ROI,
+                precision
+            )
+
+        # ================= VALIDATION ONLY =================
+        if not is_valid_take_profit(side, tp_price, market_price):
+            return False
+
+        if side == SIDE_BUY and config.SL_ENABLED and sl_price >= market_price:
+            return False
+
+        if side == SIDE_SELL and config.SL_ENABLED and sl_price <= market_price:
+            return False
 
         log_info(
             f"{symbol}\nENTRY: {entry_price}\nTP: {tp_price}\n"
+            f"TP_MODE: {tp_mode}\n"
             f"SL: {sl_price if config.SL_ENABLED else 'DISABLED'}"
         )
 

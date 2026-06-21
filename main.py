@@ -13,6 +13,7 @@ from exchange import (
     get_open_positions,
     get_open_position_counts,
     get_supported_symbols,
+    get_futures_participation,
     set_margin_type,
     setup_leverage,
     get_entry_price,
@@ -20,8 +21,15 @@ from exchange import (
 )
 
 from indicators import apply_indicators
-from strategy import check_signal, validate_adverse_zone_level
+from strategy import (
+    analyze_signal,
+    log_signal_analysis,
+    should_fetch_futures_context,
+    validate_adverse_zone_level,
+    validate_structure_take_profit
+)
 from risk_management import calculate_position_size
+from signal_journal import append_signal_journal
 from logger import log_info, log_warning, log_error
 
 
@@ -162,6 +170,7 @@ def run_bot():
 
             btc_trend_df, btc_trend = get_cached_btc_context()
             log_info(f"BTC TREND: {btc_trend}")
+            futures_context_fetches = 0
 
             for symbol in scan_symbols:
 
@@ -224,16 +233,70 @@ def run_bot():
                     # =========================
                     # SIGNAL
                     # =========================
-                    signal = check_signal(
+                    base_analysis = analyze_signal(
                         trend_df,
                         confirm_df,
                         entry_df,
                         btc_trend,
                         btc_corr,
-                        rs
+                        rs,
+                        log_details=False
                     )
+                    participation = None
+                    final_analysis = base_analysis
+
+                    if should_fetch_futures_context(base_analysis):
+                        if (
+                            futures_context_fetches <
+                            config.FUTURES_CONTEXT_MAX_SYMBOLS_PER_SCAN
+                        ):
+                            participation = get_futures_participation(symbol)
+                            futures_context_fetches += 1
+
+                            log_info(
+                                f"{symbol} FUTURES CONTEXT | "
+                                f"OI={participation.get('oi_change_pct')}% | "
+                                f"TAKER={participation.get('taker_buy_sell_ratio')} | "
+                                f"GLOBAL_LS={participation.get('global_long_short_ratio')} | "
+                                f"TOP_LS={participation.get('top_long_short_ratio')} | "
+                                f"FUNDING={participation.get('funding_rate')}"
+                            )
+
+                            final_analysis = analyze_signal(
+                                trend_df,
+                                confirm_df,
+                                entry_df,
+                                btc_trend,
+                                btc_corr,
+                                rs,
+                                participation=participation,
+                                log_details=True
+                            )
+                        else:
+                            log_warning(
+                                f"{symbol} FUTURES CONTEXT SKIPPED | "
+                                f"SCAN LIMIT={config.FUTURES_CONTEXT_MAX_SYMBOLS_PER_SCAN}"
+                            )
+                            log_signal_analysis(final_analysis)
+                    else:
+                        log_signal_analysis(final_analysis)
+
+                    signal = final_analysis["signal"]
 
                     if not signal:
+                        append_signal_journal(
+                            symbol,
+                            final_analysis,
+                            participation,
+                            trend_df,
+                            confirm_df,
+                            entry_df,
+                            btc_trend,
+                            btc_corr,
+                            rs,
+                            action="NO_SIGNAL",
+                            skip_reason="NO_FINAL_SIGNAL"
+                        )
                         log_warning(
                             f"{symbol} NO SIGNAL | "
                             f"BTC={btc_trend} | "
@@ -241,6 +304,19 @@ def run_bot():
                             f"RS={rs}"
                         )
                         continue
+
+                    append_signal_journal(
+                        symbol,
+                        final_analysis,
+                        participation,
+                        trend_df,
+                        confirm_df,
+                        entry_df,
+                        btc_trend,
+                        btc_corr,
+                        rs,
+                        action="SIGNAL"
+                    )
 
                     log_info(f"{symbol} SIGNAL: {signal}")
 
@@ -369,6 +445,31 @@ def run_bot():
                             f"USING CURRENT PRICE FOR TP"
                         )
 
+                    structure_tp = None
+
+                    if not config.STATIC_TP_ENABLED:
+                        tp_ok, structure_tp = validate_structure_take_profit(
+                            signal,
+                            entry_price,
+                            trend_df,
+                            confirm_df,
+                            leverage=config.LEVERAGE
+                        )
+
+                        if tp_ok:
+                            log_info(
+                                f"{symbol} STRUCTURE TP | "
+                                f"TARGET={structure_tp['target_price']} | "
+                                f"RAW_LEVEL={structure_tp['raw_level']} | "
+                                f"ROI={structure_tp['target_roi']}% | "
+                                f"SRC={structure_tp['source']}"
+                            )
+                        else:
+                            log_warning(
+                                f"{symbol} {structure_tp['reason']} | "
+                                f"USING FALLBACK ROI TP"
+                            )
+
                     # =========================
                     # PLACE TP/SL
                     # =========================
@@ -377,7 +478,8 @@ def run_bot():
                         side,
                         entry_price,
                         quantity,
-                        confirm_df
+                        confirm_df,
+                        structure_tp=structure_tp
                     )
 
                     if not protection_ok:
@@ -390,6 +492,18 @@ def run_bot():
                         "entry_time": datetime.now(),
                         "side": signal
                     }
+                    append_signal_journal(
+                        symbol,
+                        final_analysis,
+                        participation,
+                        trend_df,
+                        confirm_df,
+                        entry_df,
+                        btc_trend,
+                        btc_corr,
+                        rs,
+                        action="TRADE_OPENED"
+                    )
 
                     # =========================
                     # LOG SUMMARY
