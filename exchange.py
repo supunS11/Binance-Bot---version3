@@ -593,6 +593,15 @@ def is_valid_take_profit(side, tp_price, market_price):
     return tp_price < market_price
 
 
+def place_algo_order(**params):
+    return client._request_futures_api(
+        "post",
+        "algoOrder",
+        True,
+        data=params
+    )
+
+
 # =========================
 # TP/SL EXECUTION (CLEAN VERSION)
 # =========================
@@ -696,35 +705,44 @@ def place_tp_sl(symbol, side, entry_price, quantity, confirm_df, structure_tp=No
         )
 
         # TAKE PROFIT
-        tp_order = client.futures_create_order(
+        tp_order = place_algo_order(
+            algoType="CONDITIONAL",
             symbol=symbol,
             side=close_side,
             type="TAKE_PROFIT_MARKET",
-            stopPrice=tp_price,
-            closePosition=True,
+            triggerPrice=tp_price,
+            closePosition="true",
             workingType="MARK_PRICE",
-            priceProtect=True
+            priceProtect="true"
         )
         log_info(
             f"{symbol} TP order response | "
-            f"ORDER_ID={tp_order.get('orderId')} | "
-            f"STATUS={tp_order.get('status')} | "
-            f"STOP={tp_order.get('stopPrice')} | "
-            f"TYPE={tp_order.get('type')}"
+            f"ALGO_ID={tp_order.get('algoId')} | "
+            f"STATUS={tp_order.get('algoStatus')} | "
+            f"TRIGGER={tp_order.get('triggerPrice')} | "
+            f"TYPE={tp_order.get('orderType')}"
         )
 
         if config.SL_ENABLED:
             time.sleep(config.PROTECTION_ORDER_DELAY_SECONDS)
 
             # STOP LOSS
-            client.futures_create_order(
+            sl_order = place_algo_order(
+                algoType="CONDITIONAL",
                 symbol=symbol,
                 side=close_side,
                 type="STOP_MARKET",
-                stopPrice=sl_price,
-                closePosition=True,
+                triggerPrice=sl_price,
+                closePosition="true",
                 workingType="MARK_PRICE",
-                priceProtect=True
+                priceProtect="true"
+            )
+            log_info(
+                f"{symbol} SL order response | "
+                f"ALGO_ID={sl_order.get('algoId')} | "
+                f"STATUS={sl_order.get('algoStatus')} | "
+                f"TRIGGER={sl_order.get('triggerPrice')} | "
+                f"TYPE={sl_order.get('orderType')}"
             )
         else:
             log_warning(f"{symbol} SL DISABLED | CROSS-MARGIN LONG-TERM MODE")

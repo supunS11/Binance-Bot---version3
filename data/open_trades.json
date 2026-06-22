@@ -250,6 +250,31 @@
       "updated_at": "2026-06-22T15:05:49",
       "used_margin": 2.5
     },
+    "AXSUSDT": {
+      "avg_entry": 1.036,
+      "dca_count": 0,
+      "initial_entry": 1.036,
+      "last_dca_at": null,
+      "last_dca_price": null,
+      "level_info": {
+        "adverse_roi": -29.28,
+        "level": 1.0967590640446176,
+        "score": 3.16,
+        "source": "1d_ema50",
+        "touches": 0,
+        "zone_max": 1.139685591,
+        "zone_min": 1.03607781
+      },
+      "managed_by_bot": true,
+      "opened_at": "2026-06-22T21:19:16",
+      "planned_margin": 5.0,
+      "quantity": 12.0,
+      "reference_price": 1.0967590640446176,
+      "side": "SELL",
+      "symbol": "AXSUSDT",
+      "updated_at": "2026-06-22T21:19:16",
+      "used_margin": 2.5
+    },
     "BANDUSDT": {
       "avg_entry": 0.1601,
       "dca_count": 0,
