@@ -50,31 +50,6 @@
       "updated_at": "2026-06-22T05:36:38",
       "used_margin": 2.5
     },
-    "AEROUSDT": {
-      "avg_entry": 0.5285,
-      "dca_count": 0,
-      "initial_entry": 0.5285,
-      "last_dca_at": null,
-      "last_dca_price": null,
-      "level_info": {
-        "adverse_roi": -30.49,
-        "level": 0.49617723374795414,
-        "score": 3.64,
-        "source": "1d_ema200",
-        "touches": 0,
-        "zone_max": 0.5284,
-        "zone_min": 0.47556
-      },
-      "managed_by_bot": true,
-      "opened_at": "2026-06-22T13:39:17",
-      "planned_margin": 5.0,
-      "quantity": 23.7,
-      "reference_price": 0.49617723374795414,
-      "side": "BUY",
-      "symbol": "AEROUSDT",
-      "updated_at": "2026-06-22T13:39:17",
-      "used_margin": 2.5
-    },
     "ALGOUSDT": {
       "avg_entry": 0.0894,
       "dca_count": 0,
@@ -648,31 +623,6 @@
       "side": "BUY",
       "symbol": "GPSUSDT",
       "updated_at": "2026-06-22T13:40:19",
-      "used_margin": 2.5
-    },
-    "GRASSUSDT": {
-      "avg_entry": 0.4232,
-      "dca_count": 0,
-      "initial_entry": 0.4232,
-      "last_dca_at": null,
-      "last_dca_price": null,
-      "level_info": {
-        "adverse_roi": -43.26,
-        "level": 0.3864,
-        "score": 59.11,
-        "source": "1d_pivot",
-        "touches": 29,
-        "zone_max": 0.423,
-        "zone_min": 0.3807
-      },
-      "managed_by_bot": true,
-      "opened_at": "2026-06-22T09:34:21",
-      "planned_margin": 5.0,
-      "quantity": 29.6,
-      "reference_price": 0.3864,
-      "side": "BUY",
-      "symbol": "GRASSUSDT",
-      "updated_at": "2026-06-22T09:34:21",
       "used_margin": 2.5
     },
     "IOSTUSDT": {

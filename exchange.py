@@ -669,12 +669,24 @@ def place_tp_sl(symbol, side, entry_price, quantity, confirm_df, structure_tp=No
 
         # ================= VALIDATION ONLY =================
         if not is_valid_take_profit(side, tp_price, market_price):
+            log_warning(
+                f"{symbol} TP invalid | SIDE={side} | "
+                f"TP={tp_price} | MARKET={market_price} | MODE={tp_mode}"
+            )
             return False
 
         if side == SIDE_BUY and config.SL_ENABLED and sl_price >= market_price:
+            log_warning(
+                f"{symbol} SL invalid for BUY | "
+                f"SL={sl_price} | MARKET={market_price}"
+            )
             return False
 
         if side == SIDE_SELL and config.SL_ENABLED and sl_price <= market_price:
+            log_warning(
+                f"{symbol} SL invalid for SELL | "
+                f"SL={sl_price} | MARKET={market_price}"
+            )
             return False
 
         log_info(
@@ -684,7 +696,7 @@ def place_tp_sl(symbol, side, entry_price, quantity, confirm_df, structure_tp=No
         )
 
         # TAKE PROFIT
-        client.futures_create_order(
+        tp_order = client.futures_create_order(
             symbol=symbol,
             side=close_side,
             type="TAKE_PROFIT_MARKET",
@@ -692,6 +704,13 @@ def place_tp_sl(symbol, side, entry_price, quantity, confirm_df, structure_tp=No
             closePosition=True,
             workingType="MARK_PRICE",
             priceProtect=True
+        )
+        log_info(
+            f"{symbol} TP order response | "
+            f"ORDER_ID={tp_order.get('orderId')} | "
+            f"STATUS={tp_order.get('status')} | "
+            f"STOP={tp_order.get('stopPrice')} | "
+            f"TYPE={tp_order.get('type')}"
         )
 
         if config.SL_ENABLED:
