@@ -143,6 +143,11 @@ def _empty_context(symbol, reason, enabled=None):
     }
 
 
+def _is_rate_limit_reason(reason):
+    text = str(reason or "").lower()
+    return "rate limit" in text or "too many" in text or "429" in text
+
+
 def _keyword_score(title):
     text = (title or "").lower()
     score = 0
@@ -340,6 +345,10 @@ def get_news_context(symbol):
     cache = _load_cache()
     cached = cache["items"].get(symbol)
     now = time.time()
+    backoff_until = float(cache.get("provider_backoff_until", 0) or 0)
+
+    if backoff_until > now:
+        return _empty_context(symbol, "NEWS_PROVIDER_RATE_LIMIT_BACKOFF")
 
     if cached and now - float(cached.get("fetched_at", 0)) < config.NEWS_CACHE_SECONDS:
         return cached.get("context") or _empty_context(symbol, "NEWS_CACHE_EMPTY")
@@ -349,8 +358,18 @@ def get_news_context(symbol):
 
         if items is None:
             context = _empty_context(symbol, reason or "NEWS_FETCH_UNAVAILABLE")
+
+            if _is_rate_limit_reason(reason):
+                cache["provider_backoff_until"] = (
+                    now + config.NEWS_RATE_LIMIT_BACKOFF_SECONDS
+                )
+                log_warning(
+                    f"NEWS provider rate limited | "
+                    f"backoff={config.NEWS_RATE_LIMIT_BACKOFF_SECONDS}s"
+                )
         else:
             context = _summarise(symbol, items)
+            cache["provider_backoff_until"] = 0
 
         cache["items"][symbol] = {
             "fetched_at": now,
@@ -360,6 +379,17 @@ def get_news_context(symbol):
         return context
 
     except Exception as e:
+        if _is_rate_limit_reason(e):
+            cache["provider_backoff_until"] = (
+                now + config.NEWS_RATE_LIMIT_BACKOFF_SECONDS
+            )
+            _save_cache(cache)
+            log_warning(
+                f"NEWS provider rate limited | "
+                f"backoff={config.NEWS_RATE_LIMIT_BACKOFF_SECONDS}s"
+            )
+            return _empty_context(symbol, "NEWS_PROVIDER_RATE_LIMIT_BACKOFF")
+
         log_error(f"{symbol} news fetch error: {e}")
         return _empty_context(symbol, "NEWS_FETCH_ERROR")
 
