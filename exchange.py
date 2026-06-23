@@ -202,7 +202,7 @@ def get_futures_participation(symbol):
 # =========================
 # MARGIN TYPE
 # =========================
-def set_margin_type(symbol):
+def set_margin_type(symbol, allow_open_order_block=False):
 
     try:
         client.futures_change_margin_type(
@@ -214,8 +214,23 @@ def set_margin_type(symbol):
         return True
 
     except Exception as e:
-        if "No need to change margin type" not in str(e):
-            log_warning(str(e))
+        message = str(e)
+
+        if (
+            allow_open_order_block
+            and (
+                "code=-4047" in message
+                or "Margin type cannot be changed if there exists open orders" in message
+            )
+        ):
+            log_warning(
+                f"{symbol} margin type unchanged | open orders exist; "
+                "continuing with current margin type"
+            )
+            return True
+
+        if "No need to change margin type" not in message:
+            log_warning(message)
             return False
 
         log_info(f"{symbol} Margin already {config.MARGIN_TYPE}")

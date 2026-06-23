@@ -1,3 +1,4 @@
+import threading
 import time
 from datetime import datetime
 
@@ -48,6 +49,16 @@ from logger import log_info, log_warning, log_error
 
 
 trade_times = {}
+_dca_locks = {}
+_dca_locks_guard = threading.Lock()
+
+
+def get_dca_lock(symbol):
+    with _dca_locks_guard:
+        if symbol not in _dca_locks:
+            _dca_locks[symbol] = threading.Lock()
+
+        return _dca_locks[symbol]
 
 
 def get_scan_symbols():
@@ -281,7 +292,8 @@ def log_active_dca_config():
         "DCA ROI ladder active | "
         f"INITIAL_MARGIN={config.DCA_INITIAL_MARGIN_PCT}% | "
         f"LEVELS={' | '.join(levels) if levels else 'NONE'} | "
-        f"REPRICE_TP={config.DCA_REPRICE_TP_AFTER_FILL}"
+        f"REPRICE_TP={config.DCA_REPRICE_TP_AFTER_FILL} | "
+        f"WEBSOCKET={config.DCA_WEBSOCKET_ENABLED}"
     )
 
 
@@ -870,7 +882,15 @@ def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, bt
         position_detail.update(updated_position)
 
 
-def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend):
+def manage_dca_position(
+    symbol,
+    state,
+    position_detail,
+    btc_trend_df,
+    btc_trend,
+    current_price_override=None,
+    price_source="scan"
+):
     if not config.DCA_ENABLED:
         log_warning(f"{symbol} already has open position")
         return
@@ -916,7 +936,11 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
         0
     )
     old_quantity = abs(float(position_detail.get("amount", 0)))
-    current_price = get_mark_price(symbol)
+    current_price = (
+        float(current_price_override)
+        if current_price_override is not None
+        else get_mark_price(symbol)
+    )
 
     if avg_entry <= 0 or old_quantity <= 0 or current_price is None:
         log_warning(f"{symbol} DCA skipped | position price unavailable")
@@ -951,6 +975,7 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
         "reason": "ROI_LADDER_DCA",
         "level": current_price,
         "source": "roi_ladder",
+        "price_source": price_source,
         "dca_level": dca_count + 1,
         "trigger_roi": trigger_roi,
         "adverse_roi": adverse_roi,
@@ -961,7 +986,7 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
         f"{symbol} ROI LADDER DCA TRIGGERED | "
         f"LEVEL={dca_count + 1}/{config.DCA_MAX_ORDERS} | "
         f"ADVERSE_ROI={adverse_roi}% >= TRIGGER={trigger_roi}% | "
-        f"MARGIN={dca_margin}"
+        f"MARGIN={dca_margin} | SOURCE={price_source}"
     )
 
     balance = get_balance()
@@ -987,16 +1012,23 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
         log_warning(f"{symbol} DCA skipped | notional too low: {notional}")
         return
 
-    if not set_margin_type(symbol):
+    if not set_margin_type(symbol, allow_open_order_block=True):
+        log_warning(f"{symbol} DCA aborted | margin setup failed")
         return
 
     if not setup_leverage(symbol):
+        log_warning(f"{symbol} DCA aborted | leverage setup failed")
         return
 
     order_side = SIDE_BUY if side == "BUY" else SIDE_SELL
+    log_info(
+        f"{symbol} DCA placing market order | "
+        f"SIDE={order_side} | QTY={quantity} | MARGIN={dca_margin}"
+    )
     order = place_market_order(symbol, order_side, quantity)
 
     if not order:
+        log_warning(f"{symbol} DCA aborted | market order failed")
         return
 
     fill_price = get_entry_price(symbol, order)
@@ -1113,6 +1145,224 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
         position_detail.update(updated_position)
 
 
+def run_dca_check(
+    symbol,
+    position_detail,
+    btc_trend_df,
+    btc_trend,
+    current_price_override=None,
+    price_source="scan"
+):
+    lock = get_dca_lock(symbol)
+
+    if not lock.acquire(blocking=False):
+        log_info(f"{symbol} DCA check skipped | already running")
+        return
+
+    try:
+        state = load_trade_state()
+        manage_dca_position(
+            symbol,
+            state,
+            position_detail,
+            btc_trend_df,
+            btc_trend,
+            current_price_override=current_price_override,
+            price_source=price_source
+        )
+    finally:
+        lock.release()
+
+
+def dca_tick_ready(symbol, mark_price):
+    state = load_trade_state()
+    position_state = get_position_state(state, symbol)
+
+    if not position_state or not position_state.get("managed_by_bot"):
+        return False
+
+    side = position_state.get("side")
+
+    if side not in ("BUY", "SELL"):
+        return False
+
+    dca_count = int(position_state.get("dca_count", 0) or 0)
+    trigger_roi = get_dca_trigger_roi(dca_count)
+
+    if trigger_roi is None:
+        return False
+
+    avg_entry = float(position_state.get("avg_entry") or 0)
+
+    if avg_entry <= 0 or mark_price <= 0:
+        return False
+
+    adverse_roi = get_position_adverse_roi(side, avg_entry, mark_price)
+    return adverse_roi >= trigger_roi
+
+
+def parse_mark_price_message(message):
+    data = message.get("data", message) if isinstance(message, dict) else {}
+
+    if not isinstance(data, dict):
+        return None, None
+
+    symbol = data.get("s")
+    mark_price = data.get("p") or data.get("markPrice")
+
+    try:
+        return symbol, float(mark_price)
+    except (TypeError, ValueError):
+        return symbol, None
+
+
+class DcaWebsocketMonitor:
+    def __init__(self):
+        self.enabled = bool(config.DCA_ENABLED and config.DCA_WEBSOCKET_ENABLED)
+        self.twm = None
+        self.socket_key = None
+        self.streams = ()
+        self.lock = threading.Lock()
+        self.running = False
+        self.resetting = False
+
+    def start(self):
+        if not self.enabled:
+            log_info("DCA websocket monitor disabled")
+            return
+
+        try:
+            from binance import ThreadedWebsocketManager
+
+            self.twm = ThreadedWebsocketManager(
+                api_key=config.API_KEY,
+                api_secret=config.SECRET_KEY
+            )
+            self.twm.start()
+            self.running = True
+            log_info("DCA websocket monitor started")
+
+        except Exception as e:
+            self.running = False
+            log_error(f"DCA websocket monitor start error: {e}")
+
+    def _stop_socket_locked(self):
+        if not self.socket_key:
+            return
+
+        try:
+            self.twm.stop_socket(self.socket_key)
+        except Exception as e:
+            log_warning(f"DCA websocket stop warning: {e}")
+
+        self.socket_key = None
+
+    def _subscribe_locked(self, streams, reason):
+        self.streams = streams
+
+        if not streams:
+            log_info("DCA websocket monitor idle | no open positions")
+            return
+
+        try:
+            self.socket_key = self.twm.start_futures_multiplex_socket(
+                callback=self.handle_message,
+                streams=list(streams)
+            )
+            log_info(
+                f"DCA websocket watching {len(streams)} open position stream(s) | "
+                f"REASON={reason}"
+            )
+
+        except Exception as e:
+            log_error(f"DCA websocket subscribe error: {e}")
+            self.streams = ()
+            self.socket_key = None
+
+    def sync(self, position_details):
+        if not self.running:
+            return
+
+        symbols = sorted((position_details or {}).keys())
+        suffix = "@markPrice@1s" if config.DCA_WEBSOCKET_FAST_MARK_PRICE else "@markPrice"
+        streams = tuple(f"{symbol.lower()}{suffix}" for symbol in symbols)
+
+        with self.lock:
+            if streams == self.streams and self.socket_key:
+                return
+
+            self._stop_socket_locked()
+            self._subscribe_locked(streams, "sync")
+
+    def reset_connection(self, reason):
+        if not self.running:
+            return
+
+        with self.lock:
+            if self.resetting:
+                return
+
+            self.resetting = True
+
+        thread = threading.Thread(
+            target=self._reset_connection,
+            args=(reason,),
+            daemon=True
+        )
+        thread.start()
+
+    def _reset_connection(self, reason):
+        time.sleep(2)
+
+        try:
+            with self.lock:
+                streams = self.streams
+                log_warning(
+                    f"DCA websocket resetting | REASON={reason} | "
+                    f"STREAMS={len(streams)}"
+                )
+                self._stop_socket_locked()
+                self.streams = ()
+                self._subscribe_locked(streams, "reset")
+
+        finally:
+            with self.lock:
+                self.resetting = False
+
+    def handle_message(self, message):
+        if isinstance(message, dict) and message.get("e") == "error":
+            log_warning(f"DCA websocket error: {message}")
+            self.reset_connection(message.get("type") or message.get("m") or "error")
+            return
+
+        symbol, mark_price = parse_mark_price_message(message)
+
+        if not symbol or mark_price is None:
+            return
+
+        if not dca_tick_ready(symbol, mark_price):
+            return
+
+        log_warning(
+            f"{symbol} DCA websocket trigger candidate | MARK={mark_price}"
+        )
+        details = get_open_position_details(symbol)
+        position_detail = (details or {}).get(symbol)
+
+        if not position_detail:
+            log_warning(f"{symbol} DCA websocket skipped | live position not found")
+            return
+
+        run_dca_check(
+            symbol,
+            position_detail,
+            None,
+            "NEUTRAL",
+            current_price_override=mark_price,
+            price_source="websocket"
+        )
+
+
 def run_bot():
 
     log_info("BOT STARTED")
@@ -1123,6 +1373,8 @@ def run_bot():
         f"THROTTLE={config.REQUEST_THROTTLE_SECONDS}s"
     )
     log_active_dca_config()
+    dca_monitor = DcaWebsocketMonitor()
+    dca_monitor.start()
 
     while True:
 
@@ -1138,6 +1390,7 @@ def run_bot():
             trade_state = load_trade_state()
             prune_closed_positions(trade_state, open_positions)
             log_closed_trades(open_positions)
+            dca_monitor.sync(position_details)
 
             btc_trend_df, btc_trend = get_cached_btc_context()
             log_info(f"BTC TREND: {btc_trend}")
@@ -1153,12 +1406,12 @@ def run_bot():
                     # POSITION CHECK
                     # =========================
                     if symbol in open_positions:
-                        manage_dca_position(
+                        run_dca_check(
                             symbol,
-                            trade_state,
                             position_details[symbol],
                             btc_trend_df,
-                            btc_trend
+                            btc_trend,
+                            price_source="scan"
                         )
                         continue
 
@@ -1325,14 +1578,15 @@ def run_bot():
                     position_details = latest_position_details
                     open_positions = get_open_position_amounts(position_details)
                     prune_closed_positions(trade_state, open_positions)
+                    dca_monitor.sync(position_details)
 
                     if symbol in open_positions:
-                        manage_dca_position(
+                        run_dca_check(
                             symbol,
-                            trade_state,
                             position_details[symbol],
                             btc_trend_df,
-                            btc_trend
+                            btc_trend,
+                            price_source="scan"
                         )
                         continue
 
@@ -1619,6 +1873,10 @@ def run_bot():
 
                     open_positions[symbol] = quantity if signal == "BUY" else -quantity
                     orderCounts = get_open_position_counts(open_positions)
+                    latest_position_details = get_open_position_details()
+
+                    if latest_position_details is not None:
+                        dca_monitor.sync(latest_position_details)
 
                     log_info(
                         f"{symbol} OPENED | TOTAL={orderCounts['total']} | "
