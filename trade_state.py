@@ -122,7 +122,8 @@ def record_dca_fill(
     quantity,
     used_margin,
     dca_price,
-    level_info=None
+    level_info=None,
+    dca_count_increment=1
 ):
     item = get_position_state(state, symbol)
 
@@ -132,7 +133,7 @@ def record_dca_fill(
     item["avg_entry"] = avg_entry
     item["quantity"] = quantity
     item["used_margin"] = round(float(item.get("used_margin", 0)) + used_margin, 8)
-    item["dca_count"] = int(item.get("dca_count", 0)) + 1
+    item["dca_count"] = int(item.get("dca_count", 0)) + dca_count_increment
     item["last_dca_price"] = dca_price
     item["last_dca_at"] = now_iso()
     item["updated_at"] = now_iso()

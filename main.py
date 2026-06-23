@@ -296,6 +296,27 @@ def get_dca_order_margin(dca_count):
     return round(config.MARGIN_PER_TRADE * pct / 100, 8)
 
 
+def get_remaining_dca_margin(dca_count):
+    if not config.DCA_ENABLED:
+        return 0
+
+    max_orders = min(config.DCA_MAX_ORDERS, len(config.DCA_MARGIN_PCTS))
+
+    if dca_count >= max_orders:
+        return 0
+
+    total_pct = sum(
+        max(float(pct), 0)
+        for pct in config.DCA_MARGIN_PCTS[dca_count:max_orders]
+    )
+    return round(config.MARGIN_PER_TRADE * total_pct / 100, 8)
+
+
+def get_remaining_dca_order_count(dca_count):
+    max_orders = min(config.DCA_MAX_ORDERS, len(config.DCA_MARGIN_PCTS))
+    return max(max_orders - dca_count, 0)
+
+
 def get_dca_trigger_roi(dca_count):
     if dca_count >= config.DCA_MAX_ORDERS:
         return None
@@ -435,14 +456,6 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
     )
     elapsed = seconds_since(last_order_at)
 
-    if (
-        elapsed is not None
-        and elapsed < config.DCA_MIN_SECONDS_BETWEEN_ORDERS
-    ):
-        remaining = int(config.DCA_MIN_SECONDS_BETWEEN_ORDERS - elapsed)
-        log_info(f"{symbol} DCA waiting cooldown | {remaining}s remaining")
-        return
-
     avg_entry = float(
         position_detail.get("entry_price") or
         position_state.get("avg_entry") or
@@ -456,15 +469,42 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
         return
 
     adverse_roi = get_position_adverse_roi(side, avg_entry, mark_price)
+    force_remaining_dca = (
+        config.DCA_FORCE_REMAINING_ENABLED
+        and adverse_roi >= config.DCA_FORCE_REMAINING_ROI
+    )
 
-    if adverse_roi < trigger_roi:
+    if force_remaining_dca:
+        dca_margin = get_remaining_dca_margin(dca_count)
+
+        if dca_margin <= 0:
+            log_info(f"{symbol} forced DCA skipped | no remaining DCA margin")
+            return
+
+        log_warning(
+            f"{symbol} FORCE REMAINING DCA | "
+            f"ADVERSE_ROI={adverse_roi}% >= "
+            f"FORCE={config.DCA_FORCE_REMAINING_ROI}% | "
+            f"MARGIN={dca_margin}"
+        )
+
+    if (
+        not force_remaining_dca
+        and elapsed is not None
+        and elapsed < config.DCA_MIN_SECONDS_BETWEEN_ORDERS
+    ):
+        remaining = int(config.DCA_MIN_SECONDS_BETWEEN_ORDERS - elapsed)
+        log_info(f"{symbol} DCA waiting cooldown | {remaining}s remaining")
+        return
+
+    if not force_remaining_dca and adverse_roi < trigger_roi:
         log_info(
             f"{symbol} DCA not triggered | "
             f"ADVERSE_ROI={adverse_roi}% < TRIGGER={trigger_roi}%"
         )
         return
 
-    if adverse_roi > config.DCA_MAX_ADVERSE_ROI:
+    if not force_remaining_dca and adverse_roi > config.DCA_MAX_ADVERSE_ROI:
         log_warning(
             f"{symbol} DCA skipped | "
             f"ADVERSE_ROI={adverse_roi}% > MAX={config.DCA_MAX_ADVERSE_ROI}%"
@@ -478,7 +518,7 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
     )
     gap_roi = get_dca_price_gap_roi(side, anchor_price, mark_price)
 
-    if gap_roi < config.DCA_MIN_PRICE_GAP_ROI:
+    if not force_remaining_dca and gap_roi < config.DCA_MIN_PRICE_GAP_ROI:
         log_info(
             f"{symbol} DCA waiting wider price gap | "
             f"GAP={gap_roi}% < MIN={config.DCA_MIN_PRICE_GAP_ROI}%"
@@ -487,25 +527,39 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
 
     trend_df, confirm_df, entry_df = get_signal_frames(symbol, btc_trend_df)
 
-    if trend_df is None or confirm_df is None or entry_df is None:
+    if not force_remaining_dca and (
+        trend_df is None or confirm_df is None or entry_df is None
+    ):
         log_warning(f"{symbol} DCA skipped | signal data unavailable")
         return
 
-    btc_corr, rs = calculate_btc_context(symbol, trend_df, btc_trend_df)
-    analysis = analyze_signal(
-        trend_df,
-        confirm_df,
-        entry_df,
-        btc_trend,
-        btc_corr,
-        rs,
-        log_details=False
-    )
+    if trend_df is not None and confirm_df is not None and entry_df is not None:
+        btc_corr, rs = calculate_btc_context(symbol, trend_df, btc_trend_df)
+        analysis = analyze_signal(
+            trend_df,
+            confirm_df,
+            entry_df,
+            btc_trend,
+            btc_corr,
+            rs,
+            log_details=False
+        )
+    else:
+        btc_corr = ""
+        rs = ""
+        analysis = {
+            "signal": "FORCE_DCA",
+            "best_side": side,
+            "best_confidence": "",
+            "buy": {},
+            "sell": {},
+        }
+
     side_analysis = analysis.get(side.lower(), {})
     opposite_key = "sell" if side == "BUY" else "buy"
     opposite = analysis.get(opposite_key, {})
 
-    if config.DCA_REQUIRE_TREND_CONFIRMATION and not (
+    if not force_remaining_dca and config.DCA_REQUIRE_TREND_CONFIRMATION and not (
         side_analysis.get("trend_ok") and side_analysis.get("confirm_ok")
     ):
         log_warning(
@@ -527,6 +581,8 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
         return
 
     if (
+        not force_remaining_dca
+        and
         opposite.get("hard_ok")
         and opposite.get("confidence", 0) >= (
             side_analysis.get("confidence", 0) + config.LONG_TERM_MIN_SIGNAL_EDGE
@@ -548,14 +604,17 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
         )
         return
 
-    guard_ok, current_price, guard_info = check_live_entry_guard(
-        symbol,
-        side,
-        mark_price,
-        mark_price=mark_price
-    )
+    current_price = mark_price
 
-    if not guard_ok:
+    if not force_remaining_dca:
+        guard_ok, current_price, guard_info = check_live_entry_guard(
+            symbol,
+            side,
+            mark_price,
+            mark_price=mark_price
+        )
+
+    if not force_remaining_dca and not guard_ok:
         log_live_guard_block(symbol, guard_info)
         append_signal_journal(
             symbol,
@@ -572,14 +631,18 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
         )
         return
 
-    room_ok, room_info = validate_entry_profit_room(
-        side,
-        current_price,
-        trend_df,
-        confirm_df,
-        leverage=config.LEVERAGE,
-        min_roi_override=config.DCA_MIN_TP_ROOM_ROI
-    )
+    if force_remaining_dca:
+        room_ok = True
+        room_info = {"reason": "FORCE_DCA_PROFIT_ROOM_BYPASSED"}
+    else:
+        room_ok, room_info = validate_entry_profit_room(
+            side,
+            current_price,
+            trend_df,
+            confirm_df,
+            leverage=config.LEVERAGE,
+            min_roi_override=config.DCA_MIN_TP_ROOM_ROI
+        )
 
     if not room_ok:
         log_warning(f"{symbol} DCA skipped | {room_info.get('reason')}")
@@ -598,16 +661,27 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
         )
         return
 
-    log_profit_room_ok(symbol, side, room_info, prefix="DCA ")
+    if not force_remaining_dca:
+        log_profit_room_ok(symbol, side, room_info, prefix="DCA ")
 
-    level_ok, level_info = validate_dca_structure_level(
-        side,
-        current_price,
-        trend_df,
-        confirm_df,
-        entry_df,
-        leverage=config.LEVERAGE
-    )
+    if force_remaining_dca:
+        level_ok = True
+        level_info = {
+            "reason": "FORCE_REMAINING_DCA",
+            "level": current_price,
+            "source": "force_remaining_dca",
+            "score": 0,
+            "adverse_roi": adverse_roi,
+        }
+    else:
+        level_ok, level_info = validate_dca_structure_level(
+            side,
+            current_price,
+            trend_df,
+            confirm_df,
+            entry_df,
+            leverage=config.LEVERAGE
+        )
 
     if not level_ok:
         log_warning(f"{symbol} DCA skipped | {level_info.get('reason')}")
@@ -626,7 +700,10 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
         )
         return
 
-    log_dca_structure_level(symbol, side, level_info)
+    if force_remaining_dca:
+        log_warning(f"{symbol} DCA structure checks bypassed by force mode")
+    else:
+        log_dca_structure_level(symbol, side, level_info)
 
     balance = get_balance()
     quantity = calculate_position_size(
@@ -684,12 +761,21 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
         total_quantity,
         dca_margin,
         fill_price,
-        level_info
+        level_info,
+        dca_count_increment=(
+            get_remaining_dca_order_count(dca_count)
+            if force_remaining_dca
+            else 1
+        )
     )
 
     structure_tp = None
 
-    if not config.STATIC_TP_ENABLED:
+    if (
+        not config.STATIC_TP_ENABLED
+        and trend_df is not None
+        and confirm_df is not None
+    ):
         tp_ok, structure_tp = validate_structure_take_profit(
             side,
             avg_entry,
@@ -710,6 +796,11 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
                 f"{symbol} DCA {structure_tp['reason']} | "
                 f"USING FALLBACK ROI TP"
             )
+    elif not config.STATIC_TP_ENABLED and force_remaining_dca:
+        log_warning(
+            f"{symbol} FORCE DCA using fallback ROI TP | "
+            f"signal frames unavailable"
+        )
 
     if config.DCA_REPRICE_TP_AFTER_FILL:
         if cancel_open_protection_orders(symbol):
@@ -744,7 +835,9 @@ def manage_dca_position(symbol, state, position_detail, btc_trend_df, btc_trend)
         f"FILL: {fill_price}\n"
         f"AVG_ENTRY: {avg_entry}\n"
         f"QTY_TOTAL: {total_quantity}\n"
-        f"DCA_COUNT: {dca_count + 1}/{config.DCA_MAX_ORDERS}\n"
+        f"DCA_COUNT: "
+        f"{dca_count + (get_remaining_dca_order_count(dca_count) if force_remaining_dca else 1)}"
+        f"/{config.DCA_MAX_ORDERS}\n"
         f"ADVERSE_ROI_AT_TRIGGER: {adverse_roi}%\n"
     )
 
