@@ -23,6 +23,7 @@ data/open_trades.json
 data/signal_journal.csv
 data/signal_journal.bak_*.csv
 data/news_cache.json
+data/llm_cache.json
 
 # OS files
 .DS_Store

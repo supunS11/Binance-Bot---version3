@@ -73,6 +73,13 @@ FIELDNAMES = [
     "news_reason",
     "news_headline",
     "news_source",
+    "llm_enabled",
+    "llm_available",
+    "llm_action",
+    "llm_confidence_adjustment",
+    "llm_risk_label",
+    "llm_reason",
+    "llm_model",
     "skip_reason",
 ]
 
@@ -183,7 +190,8 @@ def append_signal_journal(
     rs,
     action,
     skip_reason="",
-    news_context=None
+    news_context=None,
+    llm_context=None
 ):
     if not config.SIGNAL_JOURNAL_ENABLED:
         return
@@ -196,6 +204,7 @@ def append_signal_journal(
         sell = analysis.get("sell", {})
         participation = participation or {}
         news_context = news_context or {}
+        llm_context = llm_context or {}
         row = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "symbol": symbol,
@@ -294,6 +303,16 @@ def append_signal_journal(
             "news_reason": news_context.get("reason", ""),
             "news_headline": news_context.get("headline", ""),
             "news_source": news_context.get("source", ""),
+            "llm_enabled": llm_context.get("enabled", ""),
+            "llm_available": llm_context.get("available", ""),
+            "llm_action": llm_context.get("action", ""),
+            "llm_confidence_adjustment": llm_context.get(
+                "confidence_adjustment",
+                ""
+            ),
+            "llm_risk_label": llm_context.get("risk_label", ""),
+            "llm_reason": llm_context.get("reason", ""),
+            "llm_model": llm_context.get("model", ""),
             "skip_reason": skip_reason,
         }
 

@@ -113,6 +113,24 @@ NEWS_CONFIDENCE_BOOST = env_float("NEWS_CONFIDENCE_BOOST", 3)
 NEWS_CONFIDENCE_PENALTY = env_float("NEWS_CONFIDENCE_PENALTY", 5)
 NEWS_BLOCK_HIGH_IMPACT = env_bool("NEWS_BLOCK_HIGH_IMPACT", "True")
 
+LLM_FILTER_ENABLED = env_bool("LLM_FILTER_ENABLED", "False")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "")
+LLM_BASE_URL = os.getenv(
+    "LLM_BASE_URL",
+    "https://api.openai.com/v1/chat/completions"
+)
+LLM_TIMEOUT_SECONDS = env_float("LLM_TIMEOUT_SECONDS", 8)
+LLM_MAX_RETRIES = env_int("LLM_MAX_RETRIES", 1)
+LLM_CONFIDENCE_BOOST = env_float("LLM_CONFIDENCE_BOOST", 3)
+LLM_CONFIDENCE_PENALTY = env_float("LLM_CONFIDENCE_PENALTY", 5)
+LLM_BLOCK_HIGH_RISK = env_bool("LLM_BLOCK_HIGH_RISK", "True")
+LLM_FAIL_OPEN = env_bool("LLM_FAIL_OPEN", "True")
+LLM_CACHE_SECONDS = env_int("LLM_CACHE_SECONDS", 900)
+LLM_CACHE_PATH = os.getenv("LLM_CACHE_PATH", "data/llm_cache.json")
+LLM_MAX_PROMPT_CHARS = env_int("LLM_MAX_PROMPT_CHARS", 6000)
+
 SMC_ENABLED = env_bool("SMC_ENABLED", "True")
 SMC_SWEEP_ENABLED = env_bool("SMC_SWEEP_ENABLED", "True")
 SMC_OB_ENABLED = env_bool("SMC_OB_ENABLED", "True")

@@ -36,6 +36,7 @@ from strategy import (
 )
 from risk_management import calculate_position_size
 from signal_journal import append_signal_journal
+from llm_service import apply_llm_filter
 from news_service import apply_news_filter
 from trade_state import (
     create_position_state,
@@ -1591,6 +1592,41 @@ def run_bot():
                         )
                         continue
 
+                    llm_ok, final_analysis, llm_context = apply_llm_filter(
+                        symbol,
+                        signal,
+                        final_analysis,
+                        participation=participation,
+                        btc_trend=btc_trend,
+                        btc_corr=btc_corr,
+                        rs=rs,
+                        news_context=news_context
+                    )
+                    signal = final_analysis["signal"]
+
+                    if not llm_ok:
+                        log_warning(
+                            f"{symbol} SKIP | {llm_context.get('reason')} | "
+                            f"LLM={llm_context.get('action')} "
+                            f"RISK={llm_context.get('risk_label')}"
+                        )
+                        append_signal_journal(
+                            symbol,
+                            final_analysis,
+                            participation,
+                            trend_df,
+                            confirm_df,
+                            entry_df,
+                            btc_trend,
+                            btc_corr,
+                            rs,
+                            action="SKIPPED_LLM_FILTER",
+                            skip_reason=llm_context.get("reason"),
+                            news_context=news_context,
+                            llm_context=llm_context
+                        )
+                        continue
+
                     append_signal_journal(
                         symbol,
                         final_analysis,
@@ -1602,14 +1638,18 @@ def run_bot():
                         btc_corr,
                         rs,
                         action="SIGNAL",
-                        news_context=news_context
+                        news_context=news_context,
+                        llm_context=llm_context
                     )
 
                     log_info(
                         f"{symbol} SIGNAL: {signal} | "
                         f"NEWS={news_context.get('action')} "
                         f"{news_context.get('label')} "
-                        f"SCORE={news_context.get('score')}"
+                        f"SCORE={news_context.get('score')} | "
+                        f"LLM={llm_context.get('action')} "
+                        f"{llm_context.get('risk_label')} "
+                        f"ADJ={llm_context.get('confidence_adjustment')}"
                     )
 
                     # =========================
@@ -1700,7 +1740,8 @@ def run_bot():
                                 rs,
                                 action="SKIPPED_LIVE_GUARD",
                                 skip_reason=guard_info.get("reason"),
-                                news_context=news_context
+                                news_context=news_context,
+                                llm_context=llm_context
                             )
                             continue
 
@@ -1736,7 +1777,8 @@ def run_bot():
                             rs,
                             action="SKIPPED_PROFIT_ROOM",
                             skip_reason=room_info.get("reason"),
-                            news_context=news_context
+                            news_context=news_context,
+                            llm_context=llm_context
                         )
                         continue
 
@@ -1905,7 +1947,8 @@ def run_bot():
                         btc_corr,
                         rs,
                         action="TRADE_OPENED",
-                        news_context=news_context
+                        news_context=news_context,
+                        llm_context=llm_context
                     )
 
                     # =========================
