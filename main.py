@@ -36,8 +36,8 @@ from strategy import (
 )
 from risk_management import calculate_position_size
 from signal_journal import append_signal_journal
-from llm_service import apply_llm_filter
-from news_service import apply_news_filter
+from llm_service import apply_llm_filter, begin_llm_scan_budget
+from news_service import apply_news_filter, prepare_news_scan_context
 from trade_state import (
     create_position_state,
     get_position_state,
@@ -1445,6 +1445,8 @@ def run_bot():
             btc_trend_df, btc_trend = get_cached_btc_context()
             log_info(f"BTC TREND: {btc_trend}")
             futures_context_fetches = 0
+            begin_llm_scan_budget()
+            prepare_news_scan_context(scan_symbols)
 
             for symbol in scan_symbols:
 

@@ -12,6 +12,9 @@ import config
 from logger import log_error, log_info, log_warning
 
 
+_scan_request_count = 0
+
+
 VALID_ACTIONS = {"ALLOW", "BOOST", "PENALTY", "BLOCK"}
 VALID_RISK_LABELS = {"low", "medium", "high"}
 
@@ -73,6 +76,12 @@ def _empty_context(symbol, reason, enabled=None):
         "risk_label": "",
         "reason": reason,
     }
+
+
+def begin_llm_scan_budget():
+    global _scan_request_count
+
+    _scan_request_count = 0
 
 
 def _round_value(value, digits=4):
@@ -398,6 +407,8 @@ def _normalise_review(review):
 
 
 def _get_review(payload):
+    global _scan_request_count
+
     cache = _load_cache()
     now = time.time()
     key = _cache_key(payload)
@@ -414,6 +425,13 @@ def _get_review(payload):
         return None, provider, "LLM_PROVIDER_RATE_LIMIT_BACKOFF"
 
     if provider in ("openai", "openai-compatible", "compatible"):
+        if (
+            config.LLM_MAX_REQUESTS_PER_SCAN > 0 and
+            _scan_request_count >= config.LLM_MAX_REQUESTS_PER_SCAN
+        ):
+            return None, provider, "LLM_SCAN_REQUEST_LIMIT_REACHED"
+
+        _scan_request_count += 1
         review, reason = _request_openai_compatible(payload)
     else:
         review, reason = None, f"LLM_PROVIDER_UNSUPPORTED:{provider}"
@@ -482,6 +500,8 @@ def apply_llm_filter(
 
         if context.get("reason") == "LLM_PROVIDER_RATE_LIMIT_BACKOFF":
             log_info(f"{symbol} LLM skipped | RATE_LIMIT_BACKOFF")
+        elif context.get("reason") == "LLM_SCAN_REQUEST_LIMIT_REACHED":
+            log_info(f"{symbol} LLM skipped | SCAN_REQUEST_LIMIT")
         else:
             log_warning(f"{symbol} LLM unavailable | {context.get('reason')}")
 

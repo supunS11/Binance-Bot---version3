@@ -13,6 +13,10 @@ import config
 from logger import log_error, log_info, log_warning
 
 
+_scan_news_contexts = {}
+_scan_news_prepared_at = 0
+
+
 NEGATIVE_KEYWORDS = (
     "hack",
     "exploit",
@@ -277,6 +281,15 @@ def _cryptocompare_items(asset, cache, now):
     if items is None:
         return None, reason
 
+    return _filter_cryptocompare_items(asset, items), ""
+
+
+def _filter_cryptocompare_items(asset, items):
+    asset_terms = _asset_terms(asset)
+
+    if not asset_terms:
+        return []
+
     filtered = []
 
     for item in items:
@@ -299,7 +312,7 @@ def _cryptocompare_items(asset, cache, now):
                 "votes": {},
             })
 
-    return filtered, ""
+    return filtered
 
 
 def _fetch_items(asset, cache, now):
@@ -385,9 +398,97 @@ def _summarise(symbol, items):
     }
 
 
+def prepare_news_scan_context(symbols):
+    global _scan_news_contexts, _scan_news_prepared_at
+
+    _scan_news_contexts = {}
+    _scan_news_prepared_at = time.time()
+
+    if not config.NEWS_FILTER_ENABLED:
+        return
+
+    provider = config.NEWS_PROVIDER.lower()
+
+    if provider != "cryptocompare":
+        log_info(
+            f"NEWS scan prefetch skipped | "
+            f"provider={config.NEWS_PROVIDER} uses per-symbol requests"
+        )
+        return
+
+    cache = _load_cache()
+    now = time.time()
+    backoff_until = float(cache.get("provider_backoff_until", 0) or 0)
+
+    if backoff_until > now:
+        log_info("NEWS scan prefetch skipped | RATE_LIMIT_BACKOFF")
+        return
+
+    try:
+        provider_items, reason = _cryptocompare_provider_items(cache, now)
+
+        if provider_items is None:
+            if _is_rate_limit_reason(reason):
+                cache["provider_backoff_until"] = (
+                    now + config.NEWS_RATE_LIMIT_BACKOFF_SECONDS
+                )
+                _save_cache(cache)
+                log_warning(
+                    f"NEWS provider rate limited | "
+                    f"backoff={config.NEWS_RATE_LIMIT_BACKOFF_SECONDS}s"
+                )
+            else:
+                log_warning(f"NEWS scan prefetch unavailable | {reason}")
+
+            return
+
+        prepared = 0
+
+        for symbol in symbols:
+            asset = _base_asset(symbol)
+
+            if not asset:
+                continue
+
+            items = _filter_cryptocompare_items(asset, provider_items)
+            context = _summarise(symbol, items)
+            _scan_news_contexts[symbol] = context
+            cache["items"][symbol] = {
+                "fetched_at": now,
+                "context": context,
+            }
+            prepared += 1
+
+        cache["provider_backoff_until"] = 0
+        _save_cache(cache)
+        log_info(
+            f"NEWS scan prefetch ready | "
+            f"symbols={prepared}/{len(symbols)} | provider=cryptocompare"
+        )
+
+    except Exception as e:
+        if _is_rate_limit_reason(e):
+            cache["provider_backoff_until"] = (
+                now + config.NEWS_RATE_LIMIT_BACKOFF_SECONDS
+            )
+            _save_cache(cache)
+            log_warning(
+                f"NEWS provider rate limited | "
+                f"backoff={config.NEWS_RATE_LIMIT_BACKOFF_SECONDS}s"
+            )
+            return
+
+        log_error(f"news scan prefetch error: {e}")
+
+
 def get_news_context(symbol):
     if not config.NEWS_FILTER_ENABLED:
         return _empty_context(symbol, "NEWS_FILTER_DISABLED", enabled=False)
+
+    scan_context = _scan_news_contexts.get(symbol)
+
+    if scan_context:
+        return deepcopy(scan_context)
 
     asset = _base_asset(symbol)
 
