@@ -221,10 +221,12 @@ def set_margin_type(symbol, allow_open_order_block=False):
             and (
                 "code=-4047" in message
                 or "Margin type cannot be changed if there exists open orders" in message
+                or "code=-4067" in message
+                or "Position side cannot be changed if there exists open orders" in message
             )
         ):
             log_warning(
-                f"{symbol} margin type unchanged | open orders exist; "
+                f"{symbol} margin setup unchanged | open orders exist; "
                 "continuing with current margin type"
             )
             return True

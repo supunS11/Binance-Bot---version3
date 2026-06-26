@@ -770,7 +770,8 @@ def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, bt
         log_warning(f"{symbol} DCA skipped | notional too low: {notional}")
         return
 
-    if not set_margin_type(symbol):
+    if not set_margin_type(symbol, allow_open_order_block=True):
+        log_warning(f"{symbol} DCA aborted | margin setup failed")
         return
 
     if not setup_leverage(symbol):
