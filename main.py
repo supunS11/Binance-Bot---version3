@@ -16,6 +16,7 @@ from exchange import (
     get_supported_symbols,
     get_futures_participation,
     get_mark_price,
+    get_open_take_profit_info,
     set_margin_type,
     setup_leverage,
     get_entry_price,
@@ -38,6 +39,7 @@ from risk_management import calculate_position_size
 from signal_journal import append_signal_journal
 from llm_service import apply_llm_filter, begin_llm_scan_budget
 from news_service import apply_news_filter, prepare_news_scan_context
+from telegram_service import send_order_opened_message, send_dca_filled_message
 from trade_state import (
     create_position_state,
     get_position_state,
@@ -1107,9 +1109,12 @@ def manage_dca_position(
             f"{symbol} DCA using fallback ROI TP | signal frames unavailable"
         )
 
+    old_tp_info = get_open_take_profit_info(symbol)
+    new_tp_info = {}
+
     if config.DCA_REPRICE_TP_AFTER_FILL:
         if cancel_open_protection_orders(symbol):
-            protection_ok = place_tp_sl(
+            protection_result = place_tp_sl(
                 symbol,
                 order_side,
                 avg_entry,
@@ -1121,8 +1126,11 @@ def manage_dca_position(
                     f"DCA_ROI_{dca_tp_roi}%"
                     if dca_tp_roi is not None
                     else None
-                )
+                ),
+                return_details=True
             )
+            protection_ok = bool(protection_result.get("ok"))
+            new_tp_info = protection_result
 
             if not protection_ok:
                 log_warning(f"{symbol} DCA TP ORDER NOT CREATED")
@@ -1155,6 +1163,21 @@ def manage_dca_position(
         f"DCA_MARGIN: {dca_margin}\n"
         f"DCA_COUNT: {dca_count + 1}/{config.DCA_MAX_ORDERS}\n"
         f"ADVERSE_ROI_AT_TRIGGER: {adverse_roi}%\n"
+    )
+    send_dca_filled_message(
+        symbol,
+        side,
+        dca_count + 1,
+        config.DCA_MAX_ORDERS,
+        adverse_roi,
+        trigger_roi,
+        fill_price,
+        avg_entry,
+        total_quantity,
+        dca_margin,
+        old_tp_info,
+        new_tp_info,
+        price_source
     )
 
     if updated_position:
@@ -1905,14 +1928,16 @@ def run_bot():
                     # =========================
                     # PLACE TP/SL
                     # =========================
-                    protection_ok = place_tp_sl(
+                    protection_result = place_tp_sl(
                         symbol,
                         side,
                         entry_price,
                         quantity,
                         confirm_df,
-                        structure_tp=structure_tp
+                        structure_tp=structure_tp,
+                        return_details=True
                     )
+                    protection_ok = bool(protection_result.get("ok"))
 
                     if not protection_ok:
                         log_warning(f"{symbol} TP ORDER NOT CREATED")
@@ -1963,6 +1988,17 @@ def run_bot():
                         f"ADVERSE ROI TO LEVEL: {adverse_roi}%\n"
                         f"SL: {'ENABLED' if config.SL_ENABLED else 'DISABLED'}\n"
                         f"BALANCE: {balance}\n"
+                    )
+                    send_order_opened_message(
+                        symbol,
+                        signal,
+                        entry_price,
+                        quantity,
+                        initial_margin,
+                        protection_result,
+                        final_analysis,
+                        news_context,
+                        llm_context
                     )
 
                     open_positions[symbol] = quantity if signal == "BUY" else -quantity

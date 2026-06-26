@@ -490,6 +490,55 @@ def _normalise_algo_orders(response):
     return response or []
 
 
+def _order_trigger_price(order):
+    for key in ("triggerPrice", "stopPrice", "activatePrice"):
+        value = order.get(key)
+
+        if value not in (None, ""):
+            return value
+
+    return ""
+
+
+def get_open_take_profit_info(symbol):
+    try:
+        tp_types = {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}
+
+        for order in client.futures_get_open_orders(symbol=symbol):
+            order_type = order.get("type")
+
+            if order_type not in tp_types:
+                continue
+
+            return {
+                "price": _order_trigger_price(order),
+                "tp_price": _order_trigger_price(order),
+                "type": order_type,
+                "source": "order",
+                "order_id": order.get("orderId", ""),
+            }
+
+        for order in _normalise_algo_orders(_get_open_algo_orders(symbol)):
+            order_type = order.get("orderType") or order.get("type")
+
+            if order_type not in tp_types:
+                continue
+
+            return {
+                "price": _order_trigger_price(order),
+                "tp_price": _order_trigger_price(order),
+                "type": order_type,
+                "source": "algo",
+                "order_id": order.get("algoId", ""),
+            }
+
+        return {}
+
+    except Exception as e:
+        log_warning(f"{symbol} open TP lookup error: {e}")
+        return {}
+
+
 def cancel_open_protection_orders(symbol):
 
     try:
@@ -705,8 +754,20 @@ def place_tp_sl(
     confirm_df,
     structure_tp=None,
     roi_override=None,
-    roi_mode_label=None
+    roi_mode_label=None,
+    return_details=False
 ):
+    details = {
+        "ok": False,
+        "symbol": symbol,
+        "side": side,
+        "entry_price": entry_price,
+        "quantity": quantity,
+        "tp_price": None,
+        "tp_mode": "",
+        "sl_price": None,
+        "tp_order": None,
+    }
 
     try:
         precision = get_price_precision(symbol)
@@ -714,7 +775,7 @@ def place_tp_sl(
         market_price = get_mark_price(symbol)
 
         if market_price is None:
-            return False
+            return details if return_details else False
 
         if side == SIDE_BUY:
             sl_price = None
@@ -785,27 +846,33 @@ def place_tp_sl(
                 precision
             )
 
+        details.update({
+            "tp_price": tp_price,
+            "tp_mode": tp_mode,
+            "sl_price": sl_price if config.SL_ENABLED else None,
+        })
+
         # ================= VALIDATION ONLY =================
         if not is_valid_take_profit(side, tp_price, market_price):
             log_warning(
                 f"{symbol} TP invalid | SIDE={side} | "
                 f"TP={tp_price} | MARKET={market_price} | MODE={tp_mode}"
             )
-            return False
+            return details if return_details else False
 
         if side == SIDE_BUY and config.SL_ENABLED and sl_price >= market_price:
             log_warning(
                 f"{symbol} SL invalid for BUY | "
                 f"SL={sl_price} | MARKET={market_price}"
             )
-            return False
+            return details if return_details else False
 
         if side == SIDE_SELL and config.SL_ENABLED and sl_price <= market_price:
             log_warning(
                 f"{symbol} SL invalid for SELL | "
                 f"SL={sl_price} | MARKET={market_price}"
             )
-            return False
+            return details if return_details else False
 
         log_info(
             f"{symbol}\nENTRY: {entry_price}\nTP: {tp_price}\n"
@@ -831,6 +898,7 @@ def place_tp_sl(
             f"TRIGGER={tp_order.get('triggerPrice')} | "
             f"TYPE={tp_order.get('orderType')}"
         )
+        details["tp_order"] = tp_order
 
         if config.SL_ENABLED:
             time.sleep(config.PROTECTION_ORDER_DELAY_SECONDS)
@@ -857,11 +925,12 @@ def place_tp_sl(
             log_warning(f"{symbol} SL DISABLED | CROSS-MARGIN LONG-TERM MODE")
 
         log_info(f"{symbol} TP CREATED")
-        return True
+        details["ok"] = True
+        return details if return_details else True
 
     except Exception as e:
         log_error(f"{symbol} TP/SL error: {e}")
-        return False
+        return details if return_details else False
 
 
 # =========================
