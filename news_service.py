@@ -208,6 +208,34 @@ def _empty_context(symbol, reason, enabled=None):
     }
 
 
+def _cached_symbol_context(cache, symbol, now, max_age):
+    cached = cache.get("items", {}).get(symbol)
+
+    if not cached:
+        return None
+
+    fetched_at = float(cached.get("fetched_at", 0) or 0)
+    age = max(now - fetched_at, 0)
+
+    if max_age is not None and age > max_age:
+        return None
+
+    context = deepcopy(cached.get("context") or {})
+
+    if not context:
+        return None
+
+    context["cache_status"] = (
+        "fresh" if age <= config.NEWS_CACHE_SECONDS else "stale"
+    )
+    context["cache_age_seconds"] = int(age)
+
+    if context.get("available") and context["cache_status"] == "stale":
+        context["reason"] = "NEWS_STALE_CACHE"
+
+    return context
+
+
 def _is_rate_limit_reason(reason):
     text = str(reason or "").lower()
     return (
@@ -421,7 +449,28 @@ def prepare_news_scan_context(symbols):
     backoff_until = float(cache.get("provider_backoff_until", 0) or 0)
 
     if backoff_until > now:
+        prepared = 0
+
+        for symbol in symbols:
+            context = _cached_symbol_context(
+                cache,
+                symbol,
+                now,
+                config.NEWS_STALE_CACHE_SECONDS
+            )
+
+            if context:
+                _scan_news_contexts[symbol] = context
+                prepared += 1
+
         log_info("NEWS scan prefetch skipped | RATE_LIMIT_BACKOFF")
+
+        if prepared:
+            log_info(
+                f"NEWS stale cache ready | "
+                f"symbols={prepared}/{len(symbols)}"
+            )
+
         return
 
     try:
@@ -496,15 +545,31 @@ def get_news_context(symbol):
         return _empty_context(symbol, "NEWS_SYMBOL_UNSUPPORTED")
 
     cache = _load_cache()
-    cached = cache["items"].get(symbol)
     now = time.time()
     backoff_until = float(cache.get("provider_backoff_until", 0) or 0)
 
-    if backoff_until > now:
-        return _empty_context(symbol, "NEWS_PROVIDER_RATE_LIMIT_BACKOFF")
+    fresh_context = _cached_symbol_context(
+        cache,
+        symbol,
+        now,
+        config.NEWS_CACHE_SECONDS
+    )
 
-    if cached and now - float(cached.get("fetched_at", 0)) < config.NEWS_CACHE_SECONDS:
-        return cached.get("context") or _empty_context(symbol, "NEWS_CACHE_EMPTY")
+    if fresh_context:
+        return fresh_context
+
+    if backoff_until > now:
+        stale_context = _cached_symbol_context(
+            cache,
+            symbol,
+            now,
+            config.NEWS_STALE_CACHE_SECONDS
+        )
+
+        if stale_context:
+            return stale_context
+
+        return _empty_context(symbol, "NEWS_PROVIDER_RATE_LIMIT_BACKOFF")
 
     try:
         items, reason = _fetch_items(asset, cache, now)

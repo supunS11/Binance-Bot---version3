@@ -32,7 +32,11 @@ def _load_cache():
     path = _cache_path()
 
     if not path.exists():
-        return {"items": {}, "provider_backoff_until": 0}
+        return {
+            "items": {},
+            "latest_by_symbol_side": {},
+            "provider_backoff_until": 0
+        }
 
     try:
         with path.open("r", encoding="utf-8") as file:
@@ -44,11 +48,18 @@ def _load_cache():
         if "provider_backoff_until" not in cache:
             cache["provider_backoff_until"] = 0
 
+        if "latest_by_symbol_side" not in cache:
+            cache["latest_by_symbol_side"] = {}
+
         return cache
 
     except Exception as e:
         log_error(f"llm cache load error: {e}")
-        return {"items": {}, "provider_backoff_until": 0}
+        return {
+            "items": {},
+            "latest_by_symbol_side": {},
+            "provider_backoff_until": 0
+        }
 
 
 def _save_cache(cache):
@@ -76,6 +87,49 @@ def _empty_context(symbol, reason, enabled=None):
         "risk_label": "",
         "reason": reason,
     }
+
+
+def _symbol_side_key(payload):
+    return json.dumps(
+        {
+            "symbol": payload.get("symbol"),
+            "side": payload.get("proposed_signal"),
+            "model": config.LLM_MODEL,
+        },
+        sort_keys=True
+    )
+
+
+def _cached_review(cache, key, now, max_age):
+    cached = cache.get("items", {}).get(key)
+
+    if not cached:
+        return None, ""
+
+    fetched_at = float(cached.get("fetched_at", 0) or 0)
+    age = max(now - fetched_at, 0)
+
+    if max_age is not None and age > max_age:
+        return None, ""
+
+    source = "cache" if age <= config.LLM_CACHE_SECONDS else "stale_cache"
+    return cached.get("review") or {}, source
+
+
+def _latest_symbol_side_review(cache, payload, now):
+    key = _symbol_side_key(payload)
+    cached = cache.get("latest_by_symbol_side", {}).get(key)
+
+    if not cached:
+        return None, ""
+
+    fetched_at = float(cached.get("fetched_at", 0) or 0)
+    age = max(now - fetched_at, 0)
+
+    if age > config.LLM_STALE_CACHE_SECONDS:
+        return None, ""
+
+    return cached.get("review") or {}, "symbol_side_stale_cache"
 
 
 def begin_llm_scan_budget():
@@ -412,16 +466,30 @@ def _get_review(payload):
     cache = _load_cache()
     now = time.time()
     key = _cache_key(payload)
-    cached = cache["items"].get(key)
+    review, source = _cached_review(cache, key, now, config.LLM_CACHE_SECONDS)
 
-    if cached and now - float(cached.get("fetched_at", 0)) < config.LLM_CACHE_SECONDS:
-        review = cached.get("review") or {}
-        return review, "cache", ""
+    if review is not None:
+        return review, source, ""
 
     provider = config.LLM_PROVIDER
     backoff_until = float(cache.get("provider_backoff_until", 0) or 0)
 
     if backoff_until > now:
+        review, source = _cached_review(
+            cache,
+            key,
+            now,
+            config.LLM_STALE_CACHE_SECONDS
+        )
+
+        if review is not None:
+            return review, source, ""
+
+        review, source = _latest_symbol_side_review(cache, payload, now)
+
+        if review is not None:
+            return review, source, ""
+
         return None, provider, "LLM_PROVIDER_RATE_LIMIT_BACKOFF"
 
     if provider in ("openai", "openai-compatible", "compatible"):
@@ -429,6 +497,21 @@ def _get_review(payload):
             config.LLM_MAX_REQUESTS_PER_SCAN > 0 and
             _scan_request_count >= config.LLM_MAX_REQUESTS_PER_SCAN
         ):
+            review, source = _cached_review(
+                cache,
+                key,
+                now,
+                config.LLM_STALE_CACHE_SECONDS
+            )
+
+            if review is not None:
+                return review, source, ""
+
+            review, source = _latest_symbol_side_review(cache, payload, now)
+
+            if review is not None:
+                return review, source, ""
+
             return None, provider, "LLM_SCAN_REQUEST_LIMIT_REACHED"
 
         _scan_request_count += 1
@@ -439,6 +522,12 @@ def _get_review(payload):
     if review is not None:
         cache["provider_backoff_until"] = 0
         cache["items"][key] = {
+            "fetched_at": now,
+            "review": review,
+        }
+        cache.setdefault("latest_by_symbol_side", {})[
+            _symbol_side_key(payload)
+        ] = {
             "fetched_at": now,
             "review": review,
         }
@@ -531,7 +620,7 @@ def apply_llm_filter(
     log_info(
         f"{symbol} LLM | ACTION={context['action']} | "
         f"RISK={context['risk_label']} | ADJ={delta} | "
-        f"REASON={context['reason']}"
+        f"SOURCE={context['source']} | REASON={context['reason']}"
     )
 
     if context["action"] == "BLOCK":

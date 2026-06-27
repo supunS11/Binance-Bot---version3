@@ -130,15 +130,33 @@ def record_dca_fill(
     if not item:
         return
 
+    current_count = int(item.get("dca_count", 0) or 0)
+    completed_level = None
+
+    if level_info:
+        try:
+            completed_level = int(level_info.get("dca_level") or 0)
+        except Exception:
+            completed_level = None
+
     item["avg_entry"] = avg_entry
     item["quantity"] = quantity
     item["used_margin"] = round(float(item.get("used_margin", 0)) + used_margin, 8)
-    item["dca_count"] = int(item.get("dca_count", 0)) + dca_count_increment
+    item["dca_count"] = current_count + dca_count_increment
+
+    if completed_level:
+        item["dca_count"] = max(item["dca_count"], completed_level)
+
     item["last_dca_price"] = dca_price
     item["last_dca_at"] = now_iso()
     item["updated_at"] = now_iso()
 
     if level_info:
         item["last_dca_level_info"] = level_info
+        completed_levels = item.setdefault("completed_dca_levels", [])
+
+        if completed_level and completed_level not in completed_levels:
+            completed_levels.append(completed_level)
+            completed_levels.sort()
 
     upsert_position_state(state, symbol, item)

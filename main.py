@@ -379,6 +379,19 @@ def get_position_adverse_roi(side, avg_entry, current_price):
     return round(((current_price - avg_entry) / avg_entry) * config.LEVERAGE * 100, 2)
 
 
+def get_dca_trigger_entry(position_state, avg_entry):
+    for key in ("initial_entry", "reference_price", "avg_entry"):
+        try:
+            value = float(position_state.get(key) or 0)
+        except Exception:
+            value = 0
+
+        if value > 0:
+            return value
+
+    return avg_entry
+
+
 def get_dca_price_gap_roi(side, anchor_price, current_price):
     if anchor_price <= 0 or current_price <= 0:
         return 0
@@ -510,7 +523,9 @@ def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, bt
         log_warning(f"{symbol} DCA skipped | position price unavailable")
         return
 
-    adverse_roi = get_position_adverse_roi(side, avg_entry, mark_price)
+    trigger_entry = get_dca_trigger_entry(position_state, avg_entry)
+    position_adverse_roi = get_position_adverse_roi(side, avg_entry, mark_price)
+    adverse_roi = get_position_adverse_roi(side, trigger_entry, mark_price)
     force_remaining_dca = (
         config.DCA_FORCE_REMAINING_ENABLED
         and adverse_roi >= config.DCA_FORCE_REMAINING_ROI
@@ -542,7 +557,8 @@ def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, bt
     if not force_remaining_dca and adverse_roi < trigger_roi:
         log_info(
             f"{symbol} DCA not triggered | "
-            f"ADVERSE_ROI={adverse_roi}% < TRIGGER={trigger_roi}%"
+            f"LADDER_ROI={adverse_roi}% < TRIGGER={trigger_roi}% | "
+            f"POSITION_ROI={position_adverse_roi}%"
         )
         return
 
@@ -714,6 +730,8 @@ def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, bt
             "source": "force_remaining_dca",
             "score": 0,
             "adverse_roi": adverse_roi,
+            "position_adverse_roi": position_adverse_roi,
+            "trigger_entry": trigger_entry,
         }
     else:
         level_ok, level_info = validate_dca_structure_level(
@@ -952,13 +970,20 @@ def manage_dca_position(
         log_warning(f"{symbol} DCA skipped | position price unavailable")
         return
 
-    adverse_roi = get_position_adverse_roi(side, avg_entry, current_price)
+    trigger_entry = get_dca_trigger_entry(position_state, avg_entry)
+    position_adverse_roi = get_position_adverse_roi(
+        side,
+        avg_entry,
+        current_price
+    )
+    adverse_roi = get_position_adverse_roi(side, trigger_entry, current_price)
 
     if adverse_roi < trigger_roi:
         log_info(
             f"{symbol} DCA not triggered | "
             f"LEVEL={dca_count + 1} | "
-            f"ADVERSE_ROI={adverse_roi}% < TRIGGER={trigger_roi}%"
+            f"LADDER_ROI={adverse_roi}% < TRIGGER={trigger_roi}% | "
+            f"POSITION_ROI={position_adverse_roi}%"
         )
         return
 
@@ -985,13 +1010,16 @@ def manage_dca_position(
         "dca_level": dca_count + 1,
         "trigger_roi": trigger_roi,
         "adverse_roi": adverse_roi,
+        "position_adverse_roi": position_adverse_roi,
+        "trigger_entry": trigger_entry,
         "margin": dca_margin,
     }
 
     log_warning(
         f"{symbol} ROI LADDER DCA TRIGGERED | "
         f"LEVEL={dca_count + 1}/{config.DCA_MAX_ORDERS} | "
-        f"ADVERSE_ROI={adverse_roi}% >= TRIGGER={trigger_roi}% | "
+        f"LADDER_ROI={adverse_roi}% >= TRIGGER={trigger_roi}% | "
+        f"POSITION_ROI={position_adverse_roi}% | "
         f"MARGIN={dca_margin} | SOURCE={price_source}"
     )
 
@@ -1233,11 +1261,12 @@ def dca_tick_ready(symbol, mark_price):
         return False
 
     avg_entry = float(position_state.get("avg_entry") or 0)
+    trigger_entry = get_dca_trigger_entry(position_state, avg_entry)
 
-    if avg_entry <= 0 or mark_price <= 0:
+    if trigger_entry <= 0 or mark_price <= 0:
         return False
 
-    adverse_roi = get_position_adverse_roi(side, avg_entry, mark_price)
+    adverse_roi = get_position_adverse_roi(side, trigger_entry, mark_price)
     return adverse_roi >= trigger_roi
 
 
