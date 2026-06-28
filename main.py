@@ -38,7 +38,7 @@ from strategy import (
 from risk_management import calculate_position_size
 from signal_journal import append_signal_journal
 from llm_service import apply_llm_filter, begin_llm_scan_budget
-from news_service import apply_news_filter, prepare_news_scan_context
+from news_service import apply_news_filter
 from telegram_service import (
     send_order_opened_message,
     send_dca_filled_message,
@@ -1806,6 +1806,80 @@ def execute_entry_candidate(
             f"SCORE={level_info['score']} | SRC={level_info['source']}"
         )
 
+        news_ok, final_analysis, news_context = apply_news_filter(
+            symbol,
+            signal,
+            final_analysis
+        )
+        signal = final_analysis["signal"]
+
+        if not news_ok:
+            log_warning(
+                f"{symbol} SKIP | {news_context.get('reason')} | "
+                f"NEWS={news_context.get('label')} "
+                f"SCORE={news_context.get('score')}"
+            )
+            append_signal_journal(
+                symbol,
+                final_analysis,
+                participation,
+                trend_df,
+                confirm_df,
+                entry_df,
+                btc_trend,
+                btc_corr,
+                rs,
+                action="SKIPPED_NEWS_FILTER",
+                skip_reason=news_context.get("reason"),
+                news_context=news_context
+            )
+            return position_details, open_positions, False
+
+        llm_ok, final_analysis, llm_context = apply_llm_filter(
+            symbol,
+            signal,
+            final_analysis,
+            participation=participation,
+            btc_trend=btc_trend,
+            btc_corr=btc_corr,
+            rs=rs,
+            news_context=news_context
+        )
+        signal = final_analysis["signal"]
+
+        if not llm_ok:
+            log_warning(
+                f"{symbol} SKIP | {llm_context.get('reason')} | "
+                f"LLM={llm_context.get('action')} "
+                f"RISK={llm_context.get('risk_label')}"
+            )
+            append_signal_journal(
+                symbol,
+                final_analysis,
+                participation,
+                trend_df,
+                confirm_df,
+                entry_df,
+                btc_trend,
+                btc_corr,
+                rs,
+                action="SKIPPED_LLM_FILTER",
+                skip_reason=llm_context.get("reason"),
+                news_context=news_context,
+                llm_context=llm_context
+            )
+            return position_details, open_positions, False
+
+        log_info(
+            f"{symbol} FINAL CONTEXT OK | "
+            f"NEWS={news_context.get('action')} "
+            f"{news_context.get('label')} "
+            f"SCORE={news_context.get('score')} | "
+            f"LLM={llm_context.get('action')} "
+            f"{llm_context.get('risk_label')} "
+            f"ADJ={llm_context.get('confidence_adjustment')}"
+        )
+
         balance = get_balance()
         initial_margin = get_initial_trade_margin()
         quantity = calculate_position_size(
@@ -2046,7 +2120,6 @@ def run_bot():
             futures_context_fetches = 0
             signal_candidates = []
             begin_llm_scan_budget()
-            prepare_news_scan_context(scan_symbols)
 
             for symbol in scan_symbols:
 
@@ -2165,72 +2238,9 @@ def run_bot():
                         )
                         continue
 
-                    news_ok, final_analysis, news_context = apply_news_filter(
+                    candidate = build_entry_candidate(
                         symbol,
                         signal,
-                        final_analysis
-                    )
-                    signal = final_analysis["signal"]
-
-                    if not news_ok:
-                        log_warning(
-                            f"{symbol} SKIP | {news_context.get('reason')} | "
-                            f"NEWS={news_context.get('label')} "
-                            f"SCORE={news_context.get('score')}"
-                        )
-                        append_signal_journal(
-                            symbol,
-                            final_analysis,
-                            participation,
-                            trend_df,
-                            confirm_df,
-                            entry_df,
-                            btc_trend,
-                            btc_corr,
-                            rs,
-                            action="SKIPPED_NEWS_FILTER",
-                            skip_reason=news_context.get("reason"),
-                            news_context=news_context
-                        )
-                        continue
-
-                    llm_ok, final_analysis, llm_context = apply_llm_filter(
-                        symbol,
-                        signal,
-                        final_analysis,
-                        participation=participation,
-                        btc_trend=btc_trend,
-                        btc_corr=btc_corr,
-                        rs=rs,
-                        news_context=news_context
-                    )
-                    signal = final_analysis["signal"]
-
-                    if not llm_ok:
-                        log_warning(
-                            f"{symbol} SKIP | {llm_context.get('reason')} | "
-                            f"LLM={llm_context.get('action')} "
-                            f"RISK={llm_context.get('risk_label')}"
-                        )
-                        append_signal_journal(
-                            symbol,
-                            final_analysis,
-                            participation,
-                            trend_df,
-                            confirm_df,
-                            entry_df,
-                            btc_trend,
-                            btc_corr,
-                            rs,
-                            action="SKIPPED_LLM_FILTER",
-                            skip_reason=llm_context.get("reason"),
-                            news_context=news_context,
-                            llm_context=llm_context
-                        )
-                        continue
-
-                    append_signal_journal(
-                        symbol,
                         final_analysis,
                         participation,
                         trend_df,
@@ -2239,42 +2249,27 @@ def run_bot():
                         btc_trend,
                         btc_corr,
                         rs,
-                        action="SIGNAL",
-                        news_context=news_context,
-                        llm_context=llm_context
-                    )
-
-                    log_info(
-                        f"{symbol} SIGNAL: {signal} | "
-                        f"NEWS={news_context.get('action')} "
-                        f"{news_context.get('label')} "
-                        f"SCORE={news_context.get('score')} | "
-                        f"LLM={llm_context.get('action')} "
-                        f"{llm_context.get('risk_label')} "
-                        f"ADJ={llm_context.get('confidence_adjustment')}"
+                        {},
+                        {}
                     )
 
                     if config.SIGNAL_RANKING_ENABLED:
-                        candidate = build_entry_candidate(
-                            symbol,
-                            signal,
-                            final_analysis,
-                            participation,
-                            trend_df,
-                            confirm_df,
-                            entry_df,
-                            btc_trend,
-                            btc_corr,
-                            rs,
-                            news_context,
-                            llm_context
-                        )
                         signal_candidates.append(candidate)
                         log_info(
-                            f"{symbol} SIGNAL QUEUED | "
+                            f"{symbol} TECHNICAL SIGNAL QUEUED | "
                             f"RANK_SCORE={candidate['rank_score']}"
                         )
                         continue
+
+                    position_details, open_positions, _ = execute_entry_candidate(
+                        candidate,
+                        trade_state,
+                        position_details,
+                        open_positions,
+                        btc_trend_df,
+                        dca_monitor
+                    )
+                    continue
 
                     # =========================
                     # LIVE POSITION LIMITS
