@@ -1016,6 +1016,17 @@ def find_adverse_zone_level(side, entry_price, trend_df, confirm_df, leverage=No
 
 
 def validate_adverse_zone_level(side, entry_price, trend_df, confirm_df, leverage=None):
+    if not getattr(config, "LONG_TERM_ADVERSE_ZONE_CHECK_ENABLED", True):
+        label = "support" if side == "BUY" else "resistance"
+        return True, {
+            "reason": f"{label.upper()} ADVERSE-ZONE CHECK DISABLED",
+            "level": float(entry_price),
+            "adverse_roi": 0,
+            "source": "disabled",
+            "score": 0,
+            "level_check_disabled": True,
+        }
+
     level = find_adverse_zone_level(
         side,
         entry_price,
@@ -1780,7 +1791,8 @@ def _side_signal_score(
         float(entry_quality.get("score", 0)),
         2
     )
-    level_score = 4 if level_ok else 0
+    level_check_disabled = bool(level.get("level_check_disabled")) if level else False
+    level_score = 4 if level_ok and not level_check_disabled else 0
 
     total = (
         trend_score +
