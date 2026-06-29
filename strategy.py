@@ -1473,6 +1473,70 @@ def _market_regime_score(side, trend_df, confirm_df, entry_df):
     }
 
 
+def _ema_gap_score(side, candle):
+    enabled = bool(getattr(config, "EMA_GAP_FILTER_ENABLED", True))
+    context = {
+        "enabled": enabled,
+        "score": 0,
+    }
+
+    if not enabled:
+        context["reason"] = "EMA_GAP_DISABLED"
+        return 0, context
+
+    ema20 = _safe_float(candle.get("ema20"))
+    ema50 = _safe_float(candle.get("ema50"))
+    ema200 = _safe_float(candle.get("ema200"))
+
+    if ema20 <= 0 or ema50 <= 0 or ema200 <= 0:
+        context["reason"] = "EMA_GAP_DATA_UNAVAILABLE"
+        return 0, context
+
+    gap20_50 = pct_distance(ema20, ema50)
+    gap50_200 = pct_distance(ema50, ema200)
+    min20_50 = get_config_float("MIN_EMA20_EMA50_GAP_PCT", 0.03)
+    min50_200 = get_config_float("MIN_EMA50_EMA200_GAP_PCT", 0.05)
+    max20_50 = get_config_float("MAX_EMA20_EMA50_GAP_PCT", 0)
+    max50_200 = get_config_float("MAX_EMA50_EMA200_GAP_PCT", 0)
+    bonus = get_config_float("EMA_GAP_SCORE_BONUS", 0.75)
+    penalty = get_config_float("EMA_GAP_SCORE_PENALTY", 0.5)
+
+    if side == "BUY":
+        order_ok = ema20 >= ema50 >= ema200
+    else:
+        order_ok = ema20 <= ema50 <= ema200
+
+    min_ok = gap20_50 >= min20_50 and gap50_200 >= min50_200
+    max20_ok = max20_50 <= 0 or gap20_50 <= max20_50
+    max50_ok = max50_200 <= 0 or gap50_200 <= max50_200
+    max_ok = max20_ok and max50_ok
+
+    if order_ok and min_ok and max_ok:
+        score = bonus
+        reason = "EMA_GAP_HEALTHY"
+    elif not order_ok:
+        score = -penalty
+        reason = "EMA_ORDER_NOT_ALIGNED"
+    elif not min_ok:
+        score = -penalty
+        reason = "EMA_GAP_TOO_TIGHT"
+    else:
+        score = -(penalty / 2)
+        reason = "EMA_GAP_TOO_WIDE"
+
+    score = round(float(score), 2)
+    context.update({
+        "reason": reason,
+        "score": score,
+        "order_ok": order_ok,
+        "min_ok": min_ok,
+        "max_ok": max_ok,
+        "gap20_50": round(float(gap20_50), 3),
+        "gap50_200": round(float(gap50_200), 3),
+    })
+    return score, context
+
+
 def _trend_bias_score(side, trend_df):
     trend = latest_closed(trend_df)
     prev = previous_closed(trend_df)
@@ -1507,6 +1571,9 @@ def _trend_bias_score(side, trend_df):
             trend["close"] < trend["ema50"]
             and (trend["ema20"] < trend["ema50"] or trend["ema50"] < trend["ema200"])
         )
+
+    ema_gap_score, _ = _ema_gap_score(side, trend)
+    score += ema_gap_score
 
     return score, hard_ok
 
@@ -1552,7 +1619,12 @@ def _confirmation_score(side, confirm_df):
         confirm,
         max_ema_distance
     )
+    ema_gap_score, ema_gap = _ema_gap_score(side, confirm)
     score += quality_score
+    score += ema_gap_score
+    quality["ema_gap"] = ema_gap
+    quality["ema_gap_score"] = ema_gap_score
+    quality["score"] = round(float(quality.get("score", 0)) + ema_gap_score, 2)
     hard_ok = hard_ok and quality["quality_ok"]
 
     return round(score, 2), hard_ok, quality
