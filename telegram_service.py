@@ -102,8 +102,9 @@ def send_order_opened_message(
     side_data = analysis.get((side or "").lower(), {}) or {}
     news_context = news_context or {}
     llm_context = llm_context or {}
+    signal_mode = side_data.get("confirmation_type") or "LONG_TERM"
     confirmation_type = (
-        f"LONG_TERM {config.TREND_TIMEFRAME}/"
+        f"{signal_mode} {config.TREND_TIMEFRAME}/"
         f"{config.CONFIRMATION_TIMEFRAME}/{config.ENTRY_TIMEFRAME}"
     )
     message = "\n".join([

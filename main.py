@@ -726,10 +726,12 @@ def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, bt
         )
         return
 
+    opposite_trend_ok = opposite.get("trend_following_ok", opposite.get("hard_ok"))
+
     if (
         not force_remaining_dca
         and
-        opposite.get("hard_ok")
+        opposite_trend_ok
         and opposite.get("confidence", 0) >= (
             side_analysis.get("confidence", 0) + config.LONG_TERM_MIN_SIGNAL_EDGE
         )
@@ -1755,12 +1757,19 @@ def execute_entry_candidate(
                 f"MARK={current_price} | {guard_info.get('reason')}"
             )
 
+        side_analysis = final_analysis.get(signal.lower(), {})
+        min_room_override = None
+
+        if side_analysis.get("confirmation_type") == "REVERSAL":
+            min_room_override = config.REVERSAL_MIN_TP_ROOM_ROI
+
         room_ok, room_info = validate_entry_profit_room(
             signal,
             current_price,
             trend_df,
             confirm_df,
-            leverage=config.LEVERAGE
+            leverage=config.LEVERAGE,
+            min_roi_override=min_room_override
         )
 
         if not room_ok:
@@ -2372,12 +2381,19 @@ def run_bot():
                     # =========================
                     # PROFIT-SIDE ROOM CHECK
                     # =========================
+                    side_analysis = final_analysis.get(signal.lower(), {})
+                    min_room_override = None
+
+                    if side_analysis.get("confirmation_type") == "REVERSAL":
+                        min_room_override = config.REVERSAL_MIN_TP_ROOM_ROI
+
                     room_ok, room_info = validate_entry_profit_room(
                         signal,
                         current_price,
                         trend_df,
                         confirm_df,
-                        leverage=config.LEVERAGE
+                        leverage=config.LEVERAGE,
+                        min_roi_override=min_room_override
                     )
 
                     if not room_ok:

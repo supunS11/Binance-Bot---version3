@@ -1854,6 +1854,146 @@ def _module_gates_check(
     return not failures, failures
 
 
+def _counter_trend_context(side, trend_df, confirm_df):
+    trend = latest_closed(trend_df)
+    confirm = latest_closed(confirm_df)
+
+    if side == "BUY":
+        checks = {
+            "trend_close_below_ema50": trend["close"] < trend["ema50"],
+            "trend_ema20_below_ema50": trend["ema20"] < trend["ema50"],
+            "trend_ema50_below_ema200": trend["ema50"] < trend["ema200"],
+            "confirm_close_below_ema50": confirm["close"] < confirm["ema50"],
+        }
+    else:
+        checks = {
+            "trend_close_above_ema50": trend["close"] > trend["ema50"],
+            "trend_ema20_above_ema50": trend["ema20"] > trend["ema50"],
+            "trend_ema50_above_ema200": trend["ema50"] > trend["ema200"],
+            "confirm_close_above_ema50": confirm["close"] > confirm["ema50"],
+        }
+
+    count = sum(1 for value in checks.values() if value)
+    return count >= 2, {"count": count, "checks": checks}
+
+
+def _reversal_smc_check(smc_score, smc_context):
+    if not getattr(config, "SMC_ENABLED", True):
+        return False, {"reason": "SMC_DISABLED"}
+
+    smc_context = smc_context or {}
+    supportive = {
+        "liquidity_sweep": bool(smc_context.get("liquidity_sweep")),
+        "order_block": bool(smc_context.get("order_block")),
+        "fvg_support": bool(smc_context.get("fvg_support")),
+    }
+    has_support = any(supportive.values())
+    min_smc = get_config_float("REVERSAL_MIN_SMC_SCORE", 1.0)
+
+    return (
+        has_support and _safe_float(smc_score) >= min_smc,
+        {
+            "supportive": supportive,
+            "has_block": bool(smc_context.get("fvg_block")),
+            "min_smc": min_smc,
+        }
+    )
+
+
+def _reversal_signal_check(
+    side,
+    trend_df,
+    confirm_df,
+    trend_score,
+    confirm_score,
+    entry_score,
+    quality_score,
+    smc_score,
+    smc_context,
+    regime_score,
+    confidence,
+    confirm_ok,
+    entry_ok,
+    level_ok
+):
+    context = {"enabled": bool(getattr(config, "REVERSAL_MODE_ENABLED", True))}
+    if not context["enabled"]:
+        return False, ["REVERSAL_DISABLED"], context
+
+    failures = []
+    counter_ok, counter_context = _counter_trend_context(side, trend_df, confirm_df)
+    smc_ok, smc_details = _reversal_smc_check(smc_score, smc_context)
+    context.update({
+        "counter_trend": counter_context,
+        "smc": smc_details,
+    })
+
+    if getattr(config, "REVERSAL_REQUIRE_COUNTER_TREND", True) and not counter_ok:
+        failures.append("COUNTER_TREND_CONTEXT_MISSING")
+
+    if getattr(config, "REVERSAL_REQUIRE_SMC", True) and not smc_ok:
+        failures.append("SMC_REVERSAL_EVIDENCE_MISSING")
+
+    checks = (
+        (
+            "CONFIDENCE",
+            confidence,
+            get_config_float("REVERSAL_SIGNAL_THRESHOLD", 78),
+            ">="
+        ),
+        (
+            "CONFIRM",
+            confirm_score,
+            get_config_float("REVERSAL_MIN_CONFIRM_SCORE", 8),
+            ">="
+        ),
+        (
+            "ENTRY",
+            entry_score,
+            get_config_float("REVERSAL_MIN_ENTRY_SCORE", 5),
+            ">="
+        ),
+        (
+            "QUALITY",
+            quality_score,
+            get_config_float("REVERSAL_MIN_QUALITY_SCORE", 0.75),
+            ">="
+        ),
+        (
+            "REGIME",
+            regime_score,
+            get_config_float("REVERSAL_MIN_REGIME_SCORE", -1.0),
+            ">="
+        ),
+        (
+            "TREND",
+            trend_score,
+            get_config_float("REVERSAL_MAX_TREND_SCORE", 8),
+            "<="
+        ),
+    )
+
+    for label, value, limit, operator in checks:
+        value = _safe_float(value)
+        limit = _safe_float(limit)
+
+        if operator == ">=" and value < limit:
+            failures.append(f"{label}={round(value, 2)} < {limit}")
+        elif operator == "<=" and value > limit:
+            failures.append(f"{label}={round(value, 2)} > {limit}")
+
+    if not confirm_ok:
+        failures.append("CONFIRMATION_HARD_CHECK_FAILED")
+
+    if not entry_ok:
+        failures.append("ENTRY_HARD_CHECK_FAILED")
+
+    if not level_ok:
+        failures.append("LEVEL_CHECK_FAILED")
+
+    return not failures, failures, context
+
+
 def _side_signal_score(
     side,
     trend_df,
@@ -1908,18 +2048,52 @@ def _side_signal_score(
         participation_score +
         regime_score
     )
-    hard_ok = (
+    score = max(0, total)
+    trend_confidence = score_to_confidence(score)
+    reversal_confidence = score_to_confidence(
+        score,
+        get_config_float("REVERSAL_CONFIDENCE_MAX_SCORE", 34)
+    )
+    trend_following_ok = (
         trend_ok and
         confirm_ok and
         entry_ok and
         level_ok and
         module_gates_ok
     )
+    reversal_ok, reversal_reasons, reversal_context = _reversal_signal_check(
+        side,
+        trend_df,
+        confirm_df,
+        trend_score,
+        confirm_score,
+        entry_score,
+        quality_score,
+        smc_score,
+        smc_context,
+        regime_score,
+        reversal_confidence,
+        confirm_ok,
+        entry_ok,
+        level_ok
+    )
+    hard_ok = trend_following_ok or reversal_ok
+    confirmation_type = (
+        "TREND" if trend_following_ok
+        else "REVERSAL" if reversal_ok
+        else "NONE"
+    )
+    confidence = (
+        reversal_confidence if reversal_ok and not trend_following_ok
+        else trend_confidence
+    )
 
     return {
         "side": side,
-        "score": max(0, total),
-        "confidence": score_to_confidence(max(0, total)),
+        "score": score,
+        "confidence": confidence,
+        "trend_confidence": trend_confidence,
+        "reversal_confidence": reversal_confidence,
         "base_score": trend_score + confirm_score + entry_score + btc_score + level_score,
         "trend_score": trend_score,
         "confirm_score": confirm_score,
@@ -1935,6 +2109,11 @@ def _side_signal_score(
         "regime_context": regime_context,
         "participation_score": participation_score,
         "hard_ok": hard_ok,
+        "trend_following_ok": trend_following_ok,
+        "reversal_ok": reversal_ok,
+        "reversal_reasons": reversal_reasons,
+        "reversal_context": reversal_context,
+        "confirmation_type": confirmation_type,
         "trend_ok": trend_ok,
         "confirm_ok": confirm_ok,
         "entry_ok": entry_ok,
@@ -1973,6 +2152,7 @@ def log_signal_analysis(analysis):
 
     log_info(
         f"BUY conf={buy.get('confidence', 0)}% hard={buy.get('hard_ok', False)} "
+        f"type={buy.get('confirmation_type', 'NONE')} "
         f"level={buy.get('level_ok', False)} "
         f"gates={buy.get('module_gates_ok', True)} "
         f"quality={buy.get('quality_score', 0)} "
@@ -1982,6 +2162,7 @@ def log_signal_analysis(analysis):
         f"futures={buy.get('participation_score', 0)} | "
         f"SELL conf={sell.get('confidence', 0)}% "
         f"hard={sell.get('hard_ok', False)} "
+        f"type={sell.get('confirmation_type', 'NONE')} "
         f"level={sell.get('level_ok', False)} "
         f"gates={sell.get('module_gates_ok', True)} "
         f"quality={sell.get('quality_score', 0)} "
@@ -1991,13 +2172,29 @@ def log_signal_analysis(analysis):
         f"futures={sell.get('participation_score', 0)}"
     )
 
-    if not buy.get("module_gates_ok", True):
+    if buy.get("reversal_ok"):
+        log_info(
+            "BUY REVERSAL CONFIRMED | " +
+            f"counter={buy.get('reversal_context', {}).get('counter_trend', {}).get('count')} "
+            f"smc={buy.get('smc_score', 0)} "
+            f"conf={buy.get('confidence', 0)}"
+        )
+
+    if sell.get("reversal_ok"):
+        log_info(
+            "SELL REVERSAL CONFIRMED | " +
+            f"counter={sell.get('reversal_context', {}).get('counter_trend', {}).get('count')} "
+            f"smc={sell.get('smc_score', 0)} "
+            f"conf={sell.get('confidence', 0)}"
+        )
+
+    if not buy.get("module_gates_ok", True) and not buy.get("reversal_ok"):
         log_warning(
             "BUY MODULE GATE BLOCKED | " +
             "; ".join(buy.get("module_gate_reasons", []))
         )
 
-    if not sell.get("module_gates_ok", True):
+    if not sell.get("module_gates_ok", True) and not sell.get("reversal_ok"):
         log_warning(
             "SELL MODULE GATE BLOCKED | " +
             "; ".join(sell.get("module_gate_reasons", []))
@@ -2026,10 +2223,12 @@ def log_signal_analysis(analysis):
         )
 
     if analysis["signal"]:
+        signal_details = analysis[analysis["signal"].lower()]
         log_info(
             f"FINAL LONG-TERM {analysis['signal']} "
+            f"TYPE={signal_details.get('confirmation_type', 'NONE')} "
             f"CONFIDENCE: "
-            f"{analysis[analysis['signal'].lower()].get('confidence', 0)}"
+            f"{signal_details.get('confidence', 0)}"
         )
 
 

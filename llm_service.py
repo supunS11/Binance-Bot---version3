@@ -218,9 +218,12 @@ def _compact_side(side_data):
 
     return {
         "side": side_data.get("side") or "",
+        "confirmation_type": side_data.get("confirmation_type") or "NONE",
         "confidence": _round_value(side_data.get("confidence"), 2),
         "score": _round_value(side_data.get("score"), 2),
         "hard_ok": _safe_bool(side_data.get("hard_ok")),
+        "trend_following_ok": _safe_bool(side_data.get("trend_following_ok")),
+        "reversal_ok": _safe_bool(side_data.get("reversal_ok")),
         "trend_ok": _safe_bool(side_data.get("trend_ok")),
         "confirm_ok": _safe_bool(side_data.get("confirm_ok")),
         "entry_ok": _safe_bool(side_data.get("entry_ok")),
