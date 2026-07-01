@@ -1343,6 +1343,29 @@ def run_dca_check(
         lock.release()
 
 
+def run_scan_dca_check(
+    symbol,
+    position_detail,
+    btc_trend_df,
+    btc_trend,
+    dca_monitor=None
+):
+    if (
+        dca_monitor is not None
+        and dca_monitor.should_skip_scan_dca(symbol)
+    ):
+        log_info(f"{symbol} DCA scan skipped | websocket monitor active")
+        return
+
+    run_dca_check(
+        symbol,
+        position_detail,
+        btc_trend_df,
+        btc_trend,
+        price_source="scan"
+    )
+
+
 def dca_tick_ready(symbol, mark_price):
     state = load_trade_state()
     position_state = get_position_state(state, symbol)
@@ -1496,6 +1519,19 @@ class DcaWebsocketMonitor:
 
             self._stop_socket_locked()
             self._subscribe_locked(streams, "sync")
+
+    def should_skip_scan_dca(self, symbol):
+        if not self.enabled or not self.running:
+            return False
+
+        if getattr(config, "DCA_SCAN_WHEN_WEBSOCKET_ENABLED", False):
+            return False
+
+        suffix = "@markPrice@1s" if config.DCA_WEBSOCKET_FAST_MARK_PRICE else "@markPrice"
+        stream = f"{symbol.lower()}{suffix}"
+
+        with self.lock:
+            return bool(self.socket_key and stream in self.streams)
 
     def reset_connection(self, reason):
         if not self.running:
@@ -1677,12 +1713,12 @@ def execute_entry_candidate(
         dca_monitor.sync(position_details)
 
         if symbol in open_positions:
-            run_dca_check(
+            run_scan_dca_check(
                 symbol,
                 position_details[symbol],
                 btc_trend_df,
                 btc_trend,
-                price_source="scan"
+                dca_monitor=dca_monitor
             )
             return position_details, open_positions, False
 
@@ -2140,12 +2176,12 @@ def run_bot():
                     # POSITION CHECK
                     # =========================
                     if symbol in open_positions:
-                        run_dca_check(
+                        run_scan_dca_check(
                             symbol,
                             position_details[symbol],
                             btc_trend_df,
                             btc_trend,
-                            price_source="scan"
+                            dca_monitor=dca_monitor
                         )
                         continue
 
@@ -2298,12 +2334,12 @@ def run_bot():
                     dca_monitor.sync(position_details)
 
                     if symbol in open_positions:
-                        run_dca_check(
+                        run_scan_dca_check(
                             symbol,
                             position_details[symbol],
                             btc_trend_df,
                             btc_trend,
-                            price_source="scan"
+                            dca_monitor=dca_monitor
                         )
                         continue
 
