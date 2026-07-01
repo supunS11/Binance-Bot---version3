@@ -687,6 +687,32 @@ def place_market_order(symbol, side, quantity):
         return None
 
 
+def close_position_market(symbol, amount):
+
+    try:
+        quantity = abs(float(amount))
+
+        if quantity <= 0:
+            return None
+
+        side = SIDE_SELL if float(amount) > 0 else SIDE_BUY
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type=FUTURE_ORDER_TYPE_MARKET,
+            quantity=quantity,
+            reduceOnly=True,
+            newOrderRespType="RESULT"
+        )
+
+        log_warning(f"{symbol} REDUCE-ONLY CLOSE ORDER: {side}")
+        return order
+
+    except Exception as e:
+        log_error(f"{symbol} close position error: {e}")
+        return None
+
+
 # =========================
 # STRUCTURE SL (REQUIRED BY MAIN + STRATEGY)
 # =========================

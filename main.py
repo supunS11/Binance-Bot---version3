@@ -9,7 +9,9 @@ from binance.enums import SIDE_BUY, SIDE_SELL
 from exchange import (
     get_klines,
     get_balance,
+    get_margin_balance,
     place_market_order,
+    close_position_market,
     place_tp_sl,
     get_open_position_details,
     get_open_position_counts,
@@ -42,7 +44,8 @@ from news_service import apply_news_filter
 from telegram_service import (
     send_order_opened_message,
     send_dca_filled_message,
-    send_tp_failure_message
+    send_tp_failure_message,
+    send_telegram_message
 )
 from trade_state import (
     create_position_state,
@@ -59,6 +62,8 @@ from logger import log_info, log_warning, log_error
 trade_times = {}
 _dca_locks = {}
 _dca_locks_guard = threading.Lock()
+shutdown_event = threading.Event()
+target_margin_stop_lock = threading.Lock()
 
 
 def get_dca_lock(symbol):
@@ -554,6 +559,10 @@ def place_tp_sl_with_recovery(
 
 
 def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, btc_trend):
+    if shutdown_event.is_set():
+        log_warning(f"{symbol} DCA skipped | bot shutdown requested")
+        return
+
     if not config.DCA_ENABLED:
         log_warning(f"{symbol} already has open position")
         return
@@ -885,6 +894,10 @@ def _manage_dca_position_legacy(symbol, state, position_detail, btc_trend_df, bt
     if not setup_leverage(symbol):
         return
 
+    if shutdown_event.is_set():
+        log_warning(f"{symbol} DCA order skipped | bot shutdown requested")
+        return
+
     order_side = SIDE_BUY if side == "BUY" else SIDE_SELL
     order = place_market_order(symbol, order_side, quantity)
 
@@ -1007,6 +1020,10 @@ def manage_dca_position(
     current_price_override=None,
     price_source="scan"
 ):
+    if shutdown_event.is_set():
+        log_warning(f"{symbol} DCA skipped | bot shutdown requested")
+        return
+
     if not config.DCA_ENABLED:
         log_warning(f"{symbol} already has open position")
         return
@@ -1144,6 +1161,10 @@ def manage_dca_position(
 
     if not setup_leverage(symbol):
         log_warning(f"{symbol} DCA aborted | leverage setup failed")
+        return
+
+    if shutdown_event.is_set():
+        log_warning(f"{symbol} DCA order skipped | bot shutdown requested")
         return
 
     order_side = SIDE_BUY if side == "BUY" else SIDE_SELL
@@ -1322,6 +1343,10 @@ def run_dca_check(
     current_price_override=None,
     price_source="scan"
 ):
+    if shutdown_event.is_set():
+        log_warning(f"{symbol} DCA check skipped | bot shutdown requested")
+        return
+
     lock = get_dca_lock(symbol)
 
     if not lock.acquire(blocking=False):
@@ -1409,6 +1434,96 @@ def parse_mark_price_message(message):
         return symbol, None
 
 
+def close_all_open_positions_for_target_stop():
+    position_details = get_open_position_details()
+
+    if position_details is None:
+        log_error("Target margin stop close aborted | position snapshot unavailable")
+        return False
+
+    if not position_details:
+        log_info("Target margin stop | no open positions to close")
+        return True
+
+    all_closed = True
+
+    for symbol, detail in position_details.items():
+        amount = detail.get("amount", 0)
+        cancel_open_protection_orders(symbol)
+
+        if close_position_market(symbol, amount):
+            log_warning(f"{symbol} target margin stop close submitted")
+        else:
+            all_closed = False
+            log_error(f"{symbol} target margin stop close failed")
+
+    return all_closed
+
+
+def trigger_target_margin_stop(margin_balance):
+    if shutdown_event.is_set():
+        return
+
+    with target_margin_stop_lock:
+        if shutdown_event.is_set():
+            return
+
+        shutdown_event.set()
+        log_warning(
+            "TARGET MARGIN BALANCE REACHED | "
+            f"MARGIN_BALANCE={margin_balance} | "
+            f"TARGET={config.TARGET_MARGIN_BALANCE}"
+        )
+        send_telegram_message("target margin balance reached")
+        close_all_open_positions_for_target_stop()
+
+
+class TargetMarginBalanceMonitor:
+    def __init__(self):
+        self.enabled = bool(
+            config.TARGET_MARGIN_BALANCE_STOP_ENABLED
+            and config.TARGET_MARGIN_BALANCE > 0
+        )
+        self.thread = None
+        self.stop_event = threading.Event()
+
+    def start(self):
+        if not self.enabled:
+            log_info("Target margin balance stop disabled")
+            return
+
+        self.thread = threading.Thread(
+            target=self._run,
+            name="target-margin-balance-monitor",
+            daemon=True
+        )
+        self.thread.start()
+        log_info(
+            "Target margin balance monitor started | "
+            f"TARGET={config.TARGET_MARGIN_BALANCE} | "
+            f"CHECK_SECONDS={config.TARGET_MARGIN_BALANCE_CHECK_SECONDS}"
+        )
+
+    def stop(self):
+        self.stop_event.set()
+
+    def _run(self):
+        interval = max(float(config.TARGET_MARGIN_BALANCE_CHECK_SECONDS), 0.2)
+
+        while not self.stop_event.is_set() and not shutdown_event.is_set():
+            try:
+                margin_balance = get_margin_balance()
+
+                if margin_balance >= config.TARGET_MARGIN_BALANCE:
+                    trigger_target_margin_stop(margin_balance)
+                    return
+
+            except Exception as e:
+                log_error(f"Target margin balance monitor error: {e}")
+
+            self.stop_event.wait(interval)
+
+
 class DcaWebsocketMonitor:
     def __init__(self):
         self.enabled = bool(config.DCA_ENABLED and config.DCA_WEBSOCKET_ENABLED)
@@ -1438,6 +1553,19 @@ class DcaWebsocketMonitor:
         except Exception as e:
             self.running = False
             log_error(f"DCA websocket monitor start error: {e}")
+
+    def stop(self):
+        with self.lock:
+            self.running = False
+            self._stop_socket_locked()
+
+            if self.twm:
+                try:
+                    self.twm.stop()
+                except Exception as e:
+                    log_warning(f"DCA websocket manager stop warning: {e}")
+
+            self.twm = None
 
     def _stop_socket_locked(self):
         if not self.socket_key:
@@ -1570,6 +1698,9 @@ class DcaWebsocketMonitor:
                 self.resetting = False
 
     def handle_message(self, message):
+        if shutdown_event.is_set():
+            return
+
         if isinstance(message, dict) and message.get("e") == "error":
             log_warning(f"DCA websocket error: {message}")
             self.reset_connection(message.get("type") or message.get("m") or "error")
@@ -1699,6 +1830,10 @@ def execute_entry_candidate(
     llm_context = candidate["llm_context"]
 
     try:
+        if shutdown_event.is_set():
+            log_warning(f"{symbol} entry skipped | bot shutdown requested")
+            return position_details, open_positions, False
+
         latest_position_details = get_open_position_details()
 
         if latest_position_details is None:
@@ -1957,6 +2092,10 @@ def execute_entry_candidate(
         if not setup_leverage(symbol):
             return position_details, open_positions, False
 
+        if shutdown_event.is_set():
+            log_warning(f"{symbol} entry order skipped | bot shutdown requested")
+            return position_details, open_positions, False
+
         side = SIDE_BUY if signal == "BUY" else SIDE_SELL
         order = place_market_order(symbol, side, quantity)
 
@@ -2114,6 +2253,10 @@ def process_ranked_entry_candidates(
     log_info(f"SIGNAL RANKING | CANDIDATES={len(ranked)}")
 
     for index, candidate in enumerate(ranked, start=1):
+        if shutdown_event.is_set():
+            log_warning("Signal ranking stopped | bot shutdown requested")
+            break
+
         log_info(
             f"RANK {index}/{len(ranked)} | "
             f"{candidate['symbol']} {candidate['signal']} | "
@@ -2143,255 +2286,114 @@ def run_bot():
     log_active_dca_config()
     dca_monitor = DcaWebsocketMonitor()
     dca_monitor.start()
+    target_margin_monitor = TargetMarginBalanceMonitor()
+    target_margin_monitor.start()
 
-    while True:
+    try:
+        while not shutdown_event.is_set():
+            try:
+                position_details = get_open_position_details()
 
-        try:
-            position_details = get_open_position_details()
+                if position_details is None:
+                    log_warning("Position snapshot unavailable; skipping this scan")
+                    shutdown_event.wait(config.SCAN_SLEEP_SECONDS)
+                    continue
 
-            if position_details is None:
-                log_warning("Position snapshot unavailable; skipping this scan")
-                time.sleep(config.SCAN_SLEEP_SECONDS)
-                continue
+                open_positions = get_open_position_amounts(position_details)
+                trade_state = load_trade_state()
+                prune_closed_positions(trade_state, open_positions)
+                log_closed_trades(open_positions)
+                dca_monitor.sync(position_details)
 
-            open_positions = get_open_position_amounts(position_details)
-            trade_state = load_trade_state()
-            prune_closed_positions(trade_state, open_positions)
-            log_closed_trades(open_positions)
-            dca_monitor.sync(position_details)
+                btc_trend_df, btc_trend = get_cached_btc_context()
+                log_info(f"BTC TREND: {btc_trend}")
+                futures_context_fetches = 0
+                signal_candidates = []
+                begin_llm_scan_budget()
 
-            btc_trend_df, btc_trend = get_cached_btc_context()
-            log_info(f"BTC TREND: {btc_trend}")
-            futures_context_fetches = 0
-            signal_candidates = []
-            begin_llm_scan_budget()
+                for symbol in scan_symbols:
+                    if shutdown_event.is_set():
+                        log_warning("Scan stopped | bot shutdown requested")
+                        break
 
-            for symbol in scan_symbols:
+                    try:
+                        log_info(f"Checking {symbol}")
 
-                try:
-
-                    log_info(f"Checking {symbol}")
-
-                    # =========================
-                    # POSITION CHECK
-                    # =========================
-                    if symbol in open_positions:
-                        run_scan_dca_check(
-                            symbol,
-                            position_details[symbol],
-                            btc_trend_df,
-                            btc_trend,
-                            dca_monitor=dca_monitor
-                        )
-                        continue
-
-                    # =========================
-                    # DATA
-                    # =========================
-                    trend_df, confirm_df, entry_df = get_signal_frames(
-                        symbol,
-                        btc_trend_df
-                    )
-
-                    if trend_df is None or confirm_df is None or entry_df is None:
-                        continue
-
-                    # =========================
-                    # BTC CONTEXT
-                    # =========================
-                    btc_corr, rs = calculate_btc_context(
-                        symbol,
-                        trend_df,
-                        btc_trend_df
-                    )
-
-                    log_info(f"{symbol} BTC CORR: {btc_corr}")
-                    log_info(f"{symbol} RS: {rs}%")
-
-                    # =========================
-                    # SIGNAL
-                    # =========================
-                    base_analysis = analyze_signal(
-                        trend_df,
-                        confirm_df,
-                        entry_df,
-                        btc_trend,
-                        btc_corr,
-                        rs,
-                        log_details=False
-                    )
-                    participation = None
-                    final_analysis = base_analysis
-
-                    if should_fetch_futures_context(base_analysis):
-                        if (
-                            futures_context_fetches <
-                            config.FUTURES_CONTEXT_MAX_SYMBOLS_PER_SCAN
-                        ):
-                            participation = get_futures_participation(symbol)
-                            futures_context_fetches += 1
-
-                            log_info(
-                                f"{symbol} FUTURES CONTEXT | "
-                                f"OI={participation.get('oi_change_pct')}% | "
-                                f"TAKER={participation.get('taker_buy_sell_ratio')} | "
-                                f"GLOBAL_LS={participation.get('global_long_short_ratio')} | "
-                                f"TOP_LS={participation.get('top_long_short_ratio')} | "
-                                f"FUNDING={participation.get('funding_rate')}"
-                            )
-
-                            final_analysis = analyze_signal(
-                                trend_df,
-                                confirm_df,
-                                entry_df,
+                        if symbol in open_positions:
+                            run_scan_dca_check(
+                                symbol,
+                                position_details[symbol],
+                                btc_trend_df,
                                 btc_trend,
-                                btc_corr,
-                                rs,
-                                participation=participation,
-                                log_details=True
+                                dca_monitor=dca_monitor
                             )
-                        else:
-                            log_warning(
-                                f"{symbol} FUTURES CONTEXT SKIPPED | "
-                                f"SCAN LIMIT={config.FUTURES_CONTEXT_MAX_SYMBOLS_PER_SCAN}"
-                            )
-                            log_signal_analysis(final_analysis)
-                    else:
-                        log_signal_analysis(final_analysis)
+                            continue
 
-                    signal = final_analysis["signal"]
-
-                    if not signal:
-                        append_signal_journal(
+                        trend_df, confirm_df, entry_df = get_signal_frames(
                             symbol,
-                            final_analysis,
-                            participation,
+                            btc_trend_df
+                        )
+
+                        if trend_df is None or confirm_df is None or entry_df is None:
+                            continue
+
+                        btc_corr, rs = calculate_btc_context(
+                            symbol,
+                            trend_df,
+                            btc_trend_df
+                        )
+                        log_info(f"{symbol} BTC CORR: {btc_corr}")
+                        log_info(f"{symbol} RS: {rs}%")
+
+                        base_analysis = analyze_signal(
                             trend_df,
                             confirm_df,
                             entry_df,
                             btc_trend,
                             btc_corr,
                             rs,
-                            action="NO_SIGNAL",
-                            skip_reason="NO_FINAL_SIGNAL"
+                            log_details=False
                         )
-                        log_warning(
-                            f"{symbol} NO SIGNAL | "
-                            f"BTC={btc_trend} | "
-                            f"CORR={btc_corr} | "
-                            f"RS={rs}"
-                        )
-                        continue
+                        participation = None
+                        final_analysis = base_analysis
 
-                    candidate = build_entry_candidate(
-                        symbol,
-                        signal,
-                        final_analysis,
-                        participation,
-                        trend_df,
-                        confirm_df,
-                        entry_df,
-                        btc_trend,
-                        btc_corr,
-                        rs,
-                        {},
-                        {}
-                    )
+                        if should_fetch_futures_context(base_analysis):
+                            if (
+                                futures_context_fetches <
+                                config.FUTURES_CONTEXT_MAX_SYMBOLS_PER_SCAN
+                            ):
+                                participation = get_futures_participation(symbol)
+                                futures_context_fetches += 1
+                                log_info(
+                                    f"{symbol} FUTURES CONTEXT | "
+                                    f"OI={participation.get('oi_change_pct')}% | "
+                                    f"TAKER={participation.get('taker_buy_sell_ratio')} | "
+                                    f"GLOBAL_LS={participation.get('global_long_short_ratio')} | "
+                                    f"TOP_LS={participation.get('top_long_short_ratio')} | "
+                                    f"FUNDING={participation.get('funding_rate')}"
+                                )
+                                final_analysis = analyze_signal(
+                                    trend_df,
+                                    confirm_df,
+                                    entry_df,
+                                    btc_trend,
+                                    btc_corr,
+                                    rs,
+                                    participation=participation,
+                                    log_details=True
+                                )
+                            else:
+                                log_warning(
+                                    f"{symbol} FUTURES CONTEXT SKIPPED | "
+                                    f"SCAN LIMIT={config.FUTURES_CONTEXT_MAX_SYMBOLS_PER_SCAN}"
+                                )
+                                log_signal_analysis(final_analysis)
+                        else:
+                            log_signal_analysis(final_analysis)
 
-                    if config.SIGNAL_RANKING_ENABLED:
-                        signal_candidates.append(candidate)
-                        log_info(
-                            f"{symbol} TECHNICAL SIGNAL QUEUED | "
-                            f"RANK_SCORE={candidate['rank_score']}"
-                        )
-                        continue
+                        signal = final_analysis["signal"]
 
-                    position_details, open_positions, _ = execute_entry_candidate(
-                        candidate,
-                        trade_state,
-                        position_details,
-                        open_positions,
-                        btc_trend_df,
-                        dca_monitor
-                    )
-                    continue
-
-                    # =========================
-                    # LIVE POSITION LIMITS
-                    # =========================
-                    latest_position_details = get_open_position_details()
-
-                    if latest_position_details is None:
-                        log_warning(
-                            f"{symbol} live position snapshot unavailable; "
-                            f"skipping entry"
-                        )
-                        continue
-
-                    position_details = latest_position_details
-                    open_positions = get_open_position_amounts(position_details)
-                    prune_closed_positions(trade_state, open_positions)
-                    dca_monitor.sync(position_details)
-
-                    if symbol in open_positions:
-                        run_scan_dca_check(
-                            symbol,
-                            position_details[symbol],
-                            btc_trend_df,
-                            btc_trend,
-                            dca_monitor=dca_monitor
-                        )
-                        continue
-
-                    counts = get_open_position_counts(open_positions)
-                    log_info(
-                        f"{symbol} LIVE POSITION COUNT | "
-                        f"TOTAL={counts['total']} | "
-                        f"BUY={counts['buy']} | SELL={counts['sell']}"
-                    )
-
-                    if config.MAX_TOTAL_POSITIONS and counts['total'] >= config.MAX_TOTAL_POSITIONS:
-                        log_warning(
-                            f"🚨 MAX POSITIONS REACHED 🚨\n"
-                            f"TOTAL OPEN: {counts['total']}/{config.MAX_TOTAL_POSITIONS}\n"
-                            f"BUY: {counts['buy']} | SELL: {counts['sell']}\n"
-                            f"Skipping new entries..."
-    )
-                        continue
-
-                    if signal == "BUY" and config.MAX_BUY_POSITIONS and counts['buy'] >= config.MAX_BUY_POSITIONS:
-                        log_warning(
-                            f"🚨 MAX BUY POSITIONS REACHED | "
-                            f"BUY={counts['buy']}/{config.MAX_BUY_POSITIONS} | "
-                            f"TOTAL={counts['total']}"
-                        )
-                        continue
-
-                    if signal == "SELL" and config.MAX_SELL_POSITIONS and counts['sell'] >= config.MAX_SELL_POSITIONS:
-                        log_warning(
-                            f"🚨 MAX SELL POSITIONS REACHED | "
-                            f"SELL={counts['sell']}/{config.MAX_SELL_POSITIONS} | "
-                            f"TOTAL={counts['total']}"
-                        )
-                        continue
-
-                    # =========================
-                    # PRICE (PRE-ENTRY)
-                    # =========================
-                    current_price = entry_df['close'].iloc[-2]
-
-                    # =========================
-                    # LIVE ENTRY REVERSAL GUARD
-                    # =========================
-                    if config.LIVE_ENTRY_CONFIRMATION_ENABLED:
-                        guard_ok, current_price, guard_info = check_live_entry_guard(
-                            symbol,
-                            signal,
-                            current_price
-                        )
-
-                        if not guard_ok:
-                            log_live_guard_block(symbol, guard_info)
+                        if not signal:
                             append_signal_journal(
                                 symbol,
                                 final_analysis,
@@ -2402,42 +2404,18 @@ def run_bot():
                                 btc_trend,
                                 btc_corr,
                                 rs,
-                                action="SKIPPED_LIVE_GUARD",
-                                skip_reason=guard_info.get("reason"),
-                                news_context=news_context,
-                                llm_context=llm_context
+                                action="NO_SIGNAL",
+                                skip_reason="NO_FINAL_SIGNAL"
+                            )
+                            log_warning(
+                                f"{symbol} NO SIGNAL | "
+                                f"BTC={btc_trend} | CORR={btc_corr} | RS={rs}"
                             )
                             continue
 
-                        log_info(
-                            f"{symbol} LIVE ENTRY GUARD OK | "
-                            f"MARK={current_price} | {guard_info.get('reason')}"
-                        )
-
-                    # =========================
-                    # PROFIT-SIDE ROOM CHECK
-                    # =========================
-                    side_analysis = final_analysis.get(signal.lower(), {})
-                    min_room_override = None
-
-                    if side_analysis.get("confirmation_type") == "REVERSAL":
-                        min_room_override = config.REVERSAL_MIN_TP_ROOM_ROI
-
-                    room_ok, room_info = validate_entry_profit_room(
-                        signal,
-                        current_price,
-                        trend_df,
-                        confirm_df,
-                        leverage=config.LEVERAGE,
-                        min_roi_override=min_room_override
-                    )
-
-                    if not room_ok:
-                        log_warning(
-                            f"{symbol} SKIP | {room_info.get('reason')}"
-                        )
-                        append_signal_journal(
+                        candidate = build_entry_candidate(
                             symbol,
+                            signal,
                             final_analysis,
                             participation,
                             trend_df,
@@ -2446,253 +2424,55 @@ def run_bot():
                             btc_trend,
                             btc_corr,
                             rs,
-                            action="SKIPPED_PROFIT_ROOM",
-                            skip_reason=room_info.get("reason"),
-                            news_context=news_context,
-                            llm_context=llm_context
-                        )
-                        continue
-
-                    log_profit_room_ok(symbol, signal, room_info)
-
-                    # =========================
-                    # LONG-TERM ADVERSE-ZONE SUPPORT / RESISTANCE
-                    # =========================
-                    level_ok, level_info = validate_adverse_zone_level(
-                        signal,
-                        current_price,
-                        trend_df,
-                        confirm_df,
-                        leverage=config.LEVERAGE
-                    )
-
-                    if not level_ok:
-                        log_warning(
-                            f"{symbol} SKIP | {level_info.get('reason')}"
-                        )
-                        continue
-
-                    reference_price = level_info["level"]
-                    adverse_roi = level_info["adverse_roi"]
-                    level_label = "SUPPORT" if signal == "BUY" else "RESISTANCE"
-
-                    log_info(
-                        f"{symbol} {level_label} SAFETY LEVEL | "
-                        f"PRICE={reference_price} | ROI={adverse_roi}% | "
-                        f"SCORE={level_info['score']} | SRC={level_info['source']}"
-                    )
-
-                    # =========================
-                    # POSITION SIZE
-                    # =========================
-                    balance = get_balance()
-                    initial_margin = get_initial_trade_margin()
-
-                    quantity = calculate_position_size(
-                        balance,
-                        current_price,
-                        reference_price,
-                        symbol,
-                        initial_margin
-                    )
-
-                    notional = quantity * current_price
-
-                    log_info(
-                        f"{symbol} QTY={quantity} | NOTIONAL={notional:.2f}"
-                    )
-
-                    if quantity <= 0:
-                        log_warning(f"{symbol} SKIPPED | INVALID QTY")
-                        continue
-
-                    log_info(f"{symbol} QTY: {quantity}")
-
-                    notional_ok, notional = validate_min_notional(
-                        symbol,
-                        quantity,
-                        current_price
-                    )
-
-                    if not notional_ok:
-                        log_warning(f"{symbol} SKIP | NOTIONAL TOO LOW: {notional}")
-                        continue
-
-                    # =========================
-                    # MARGIN / LEVERAGE
-                    # =========================
-                    if not set_margin_type(symbol):
-                        continue
-
-                    if not setup_leverage(symbol):
-                        continue
-
-                    # =========================
-                    # PLACE ORDER
-                    # =========================
-                    side = SIDE_BUY if signal == "BUY" else SIDE_SELL
-
-                    order = place_market_order(symbol, side, quantity)
-
-                    if not order:
-                        continue
-
-                    entry_price = get_entry_price(symbol, order)
-
-                    if entry_price <= 0:
-                        entry_price = current_price
-                        log_warning(
-                            f"{symbol} ENTRY PRICE UNAVAILABLE | "
-                            f"USING CURRENT PRICE FOR TP"
+                            {},
+                            {}
                         )
 
-                    structure_tp = None
-
-                    if not config.STATIC_TP_ENABLED:
-                        tp_ok, structure_tp = validate_structure_take_profit(
-                            signal,
-                            entry_price,
-                            trend_df,
-                            confirm_df,
-                            leverage=config.LEVERAGE
-                        )
-
-                        if tp_ok:
+                        if config.SIGNAL_RANKING_ENABLED:
+                            signal_candidates.append(candidate)
                             log_info(
-                                f"{symbol} STRUCTURE TP | "
-                                f"TARGET={structure_tp['target_price']} | "
-                                f"RAW_LEVEL={structure_tp['raw_level']} | "
-                                f"ROI={structure_tp['target_roi']}% | "
-                                f"SRC={structure_tp['source']}"
+                                f"{symbol} TECHNICAL SIGNAL QUEUED | "
+                                f"RANK_SCORE={candidate['rank_score']}"
                             )
-                        else:
-                            log_warning(
-                                f"{symbol} {structure_tp['reason']} | "
-                                f"USING FALLBACK ROI TP"
-                            )
+                            continue
 
-                    # =========================
-                    # PLACE TP/SL
-                    # =========================
-                    protection_result = place_tp_sl_with_recovery(
-                        symbol,
-                        side,
-                        entry_price,
-                        quantity,
-                        confirm_df,
-                        structure_tp=structure_tp,
-                        context_label="ENTRY",
-                        return_details=True
-                    )
-                    protection_ok = bool(protection_result.get("ok"))
+                        position_details, open_positions, _ = execute_entry_candidate(
+                            candidate,
+                            trade_state,
+                            position_details,
+                            open_positions,
+                            btc_trend_df,
+                            dca_monitor
+                        )
 
-                    if not protection_ok:
-                        log_warning(f"{symbol} TP ORDER NOT CREATED")
+                    except Exception as e:
+                        log_error(f"{symbol} ERROR: {e}")
 
-                    # =========================
-                    # STORE TRADE
-                    # =========================
-                    trade_times[symbol] = {
-                        "entry_time": datetime.now(),
-                        "side": signal
-                    }
-                    position_state = create_position_state(
-                        symbol,
-                        signal,
-                        entry_price,
-                        quantity,
-                        config.MARGIN_PER_TRADE,
-                        initial_margin,
-                        reference_price,
-                        level_info
-                    )
-                    position_state["tp_status"] = (
-                        "CREATED" if protection_ok else "FAILED"
-                    )
-                    position_state["tp_price"] = protection_result.get("tp_price")
-                    position_state["tp_mode"] = protection_result.get("tp_mode")
-                    position_state["tp_context"] = "ENTRY"
-                    position_state["tp_updated_at"] = datetime.now().isoformat(
-                        timespec="seconds"
-                    )
-                    upsert_position_state(
+                if config.SIGNAL_RANKING_ENABLED and not shutdown_event.is_set():
+                    position_details, open_positions = process_ranked_entry_candidates(
+                        signal_candidates,
                         trade_state,
-                        symbol,
-                        position_state
-                    )
-                    append_signal_journal(
-                        symbol,
-                        final_analysis,
-                        participation,
-                        trend_df,
-                        confirm_df,
-                        entry_df,
-                        btc_trend,
-                        btc_corr,
-                        rs,
-                        action="TRADE_OPENED",
-                        news_context=news_context,
-                        llm_context=llm_context
+                        position_details,
+                        open_positions,
+                        btc_trend_df,
+                        dca_monitor
                     )
 
-                    # =========================
-                    # LOG SUMMARY
-                    # =========================
-                    log_info(
-                        f"*** {symbol} TRADE OPENED ***\n"
-                        f"ENTRY: {entry_price}\n"
-                        f"{level_label}: {reference_price}\n"
-                        f"ADVERSE ROI TO LEVEL: {adverse_roi}%\n"
-                        f"SL: {'ENABLED' if config.SL_ENABLED else 'DISABLED'}\n"
-                        f"BALANCE: {balance}\n"
-                    )
-                    send_order_opened_message(
-                        symbol,
-                        signal,
-                        entry_price,
-                        quantity,
-                        initial_margin,
-                        protection_result,
-                        final_analysis,
-                        news_context,
-                        llm_context
-                    )
+                if shutdown_event.is_set():
+                    break
 
-                    open_positions[symbol] = quantity if signal == "BUY" else -quantity
-                    orderCounts = get_open_position_counts(open_positions)
-                    latest_position_details = get_open_position_details()
+                log_info("Waiting next scan...")
+                shutdown_event.wait(config.SCAN_SLEEP_SECONDS)
 
-                    if latest_position_details is not None:
-                        dca_monitor.sync(latest_position_details)
+            except Exception as e:
+                log_error(f"MAIN LOOP ERROR: {e}")
+                shutdown_event.wait(config.SCAN_SLEEP_SECONDS)
 
-                    log_info(
-                        f"{symbol} OPENED | TOTAL={orderCounts['total']} | "
-                        f"BUY={orderCounts['buy']} | SELL={orderCounts['sell']}"
-                    )
+    finally:
+        target_margin_monitor.stop()
+        dca_monitor.stop()
 
-                    if config.POST_TRADE_SLEEP_SECONDS > 0:
-                        time.sleep(config.POST_TRADE_SLEEP_SECONDS)
-
-                except Exception as e:
-                    log_error(f"{symbol} ERROR: {e}")
-
-            if config.SIGNAL_RANKING_ENABLED:
-                position_details, open_positions = process_ranked_entry_candidates(
-                    signal_candidates,
-                    trade_state,
-                    position_details,
-                    open_positions,
-                    btc_trend_df,
-                    dca_monitor
-                )
-
-            log_info("Waiting next scan...")
-            time.sleep(config.SCAN_SLEEP_SECONDS)
-
-        except Exception as e:
-            log_error(f"MAIN LOOP ERROR: {e}")
-            time.sleep(config.SCAN_SLEEP_SECONDS)
-
+    log_warning("BOT STOPPED | manual restart required")
 
 if __name__ == "__main__":
     run_bot()
