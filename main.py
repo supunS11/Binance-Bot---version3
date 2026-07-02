@@ -1783,62 +1783,85 @@ def get_candidate_signal_type(candidate):
     return str(side_data.get("confirmation_type") or "").upper()
 
 
-def effective_position_limit(base_limit, reversal_extra, reversal_signal):
-    if not reversal_signal:
-        return base_limit
-
-    extra = max(int(reversal_extra or 0), 0)
-
-    if extra <= 0:
-        return base_limit
-
-    return (int(base_limit) if base_limit else 0) + extra
+def _empty_position_counts():
+    return {"total": 0, "buy": 0, "sell": 0}
 
 
-def check_entry_position_limits(signal, signal_type, counts):
+def get_position_signal_type(trade_state, symbol):
+    item = get_position_state(trade_state, symbol) or {}
+    signal_type = str(
+        item.get("signal_type") or
+        item.get("confirmation_type") or
+        ""
+    ).upper()
+
+    return "REVERSAL" if signal_type == "REVERSAL" else "TREND"
+
+
+def get_position_pool_counts(trade_state, open_positions):
+    pools = {
+        "TREND": _empty_position_counts(),
+        "REVERSAL": _empty_position_counts(),
+    }
+
+    for symbol, amount in (open_positions or {}).items():
+        if amount == 0:
+            continue
+
+        pool = get_position_signal_type(trade_state, symbol)
+        counts = pools[pool]
+        counts["total"] += 1
+
+        if amount > 0:
+            counts["buy"] += 1
+        else:
+            counts["sell"] += 1
+
+    return pools
+
+
+def _limit_reached(limit, count):
+    return limit is not None and count >= limit
+
+
+def check_entry_position_limits(signal, signal_type, pool_counts):
     reversal_signal = signal_type == "REVERSAL"
-    total_limit = effective_position_limit(
-        config.MAX_TOTAL_POSITIONS,
-        getattr(config, "REVERSAL_EXTRA_TOTAL_POSITIONS", 0),
-        reversal_signal
-    )
-    buy_limit = effective_position_limit(
-        config.MAX_BUY_POSITIONS,
-        getattr(config, "REVERSAL_EXTRA_BUY_POSITIONS", 0),
-        reversal_signal
-    )
-    sell_limit = effective_position_limit(
-        config.MAX_SELL_POSITIONS,
-        getattr(config, "REVERSAL_EXTRA_SELL_POSITIONS", 0),
-        reversal_signal
-    )
-    label = "REVERSAL" if reversal_signal else "NORMAL"
+    pool = "REVERSAL" if reversal_signal else "TREND"
+    counts = pool_counts.get(pool, _empty_position_counts())
 
-    if total_limit and counts["total"] >= total_limit:
+    if reversal_signal:
+        total_limit = getattr(config, "REVERSAL_EXTRA_TOTAL_POSITIONS", 0)
+        buy_limit = getattr(config, "REVERSAL_EXTRA_BUY_POSITIONS", 0)
+        sell_limit = getattr(config, "REVERSAL_EXTRA_SELL_POSITIONS", 0)
+    else:
+        total_limit = config.MAX_TOTAL_POSITIONS
+        buy_limit = config.MAX_BUY_POSITIONS
+        sell_limit = config.MAX_SELL_POSITIONS
+
+    if _limit_reached(total_limit, counts["total"]):
         return False, (
-            f"{label} MAX POSITIONS REACHED | "
+            f"{pool} MAX POSITIONS REACHED | "
             f"TOTAL={counts['total']}/{total_limit} | "
             f"BUY={counts['buy']} | SELL={counts['sell']}"
         )
 
-    if signal == "BUY" and buy_limit and counts["buy"] >= buy_limit:
+    if signal == "BUY" and _limit_reached(buy_limit, counts["buy"]):
         return False, (
-            f"{label} MAX BUY POSITIONS REACHED | "
+            f"{pool} MAX BUY POSITIONS REACHED | "
             f"BUY={counts['buy']}/{buy_limit} | TOTAL={counts['total']}"
         )
 
-    if signal == "SELL" and sell_limit and counts["sell"] >= sell_limit:
+    if signal == "SELL" and _limit_reached(sell_limit, counts["sell"]):
         return False, (
-            f"{label} MAX SELL POSITIONS REACHED | "
+            f"{pool} MAX SELL POSITIONS REACHED | "
             f"SELL={counts['sell']}/{sell_limit} | TOTAL={counts['total']}"
         )
 
-    if reversal_signal:
-        log_info(
-            f"REVERSAL LIMIT OK | TOTAL={counts['total']}/{total_limit or 'NA'} | "
-            f"BUY={counts['buy']}/{buy_limit or 'NA'} | "
-            f"SELL={counts['sell']}/{sell_limit or 'NA'}"
-        )
+    log_info(
+        f"{pool} LIMIT OK | TOTAL={counts['total']}/{total_limit if total_limit is not None else 'NA'} | "
+        f"BUY={counts['buy']}/{buy_limit if buy_limit is not None else 'NA'} | "
+        f"SELL={counts['sell']}/{sell_limit if sell_limit is not None else 'NA'}"
+    )
 
     return True, ""
 
@@ -1931,10 +1954,11 @@ def execute_entry_candidate(
             f"TOTAL={counts['total']} | BUY={counts['buy']} | SELL={counts['sell']}"
         )
 
+        pool_counts = get_position_pool_counts(trade_state, open_positions)
         limit_ok, limit_reason = check_entry_position_limits(
             signal,
             signal_type,
-            counts
+            pool_counts
         )
 
         if not limit_ok:
