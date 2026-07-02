@@ -1900,6 +1900,137 @@ def _reversal_smc_check(smc_score, smc_context):
     )
 
 
+def _directional_candle_context(side, candle):
+    open_price = _safe_float(candle.get("open"))
+    high = _safe_float(candle.get("high"))
+    low = _safe_float(candle.get("low"))
+    close = _safe_float(candle.get("close"))
+    atr = _candle_atr(candle)
+    ema20 = _safe_float(candle.get("ema20"))
+    macd = _safe_float(candle.get("macd"))
+    macd_signal = _safe_float(candle.get("macd_signal"))
+    rsi = _safe_float(candle.get("rsi"), 50)
+    candle_range = max(high - low, 1e-10)
+    close_position = (close - low) / candle_range
+    directional_close = close_position if side == "BUY" else 1 - close_position
+    directional_body = close - open_price if side == "BUY" else open_price - close
+    body_atr = directional_body / atr
+    tolerance = get_config_float("REVERSAL_MOMENTUM_EMA_TOLERANCE_PCT", 0.25) / 100
+
+    if side == "BUY":
+        direction_ok = close > open_price
+        ema_reclaimed = ema20 > 0 and close >= ema20
+        ema_near = ema20 > 0 and close >= ema20 * (1 - tolerance)
+        oscillator_ok = macd > macd_signal or rsi > 50
+    else:
+        direction_ok = close < open_price
+        ema_reclaimed = ema20 > 0 and close <= ema20
+        ema_near = ema20 > 0 and close <= ema20 * (1 + tolerance)
+        oscillator_ok = macd < macd_signal or rsi < 50
+
+    return {
+        "direction_ok": direction_ok,
+        "directional_close": round(float(directional_close), 3),
+        "body_atr": round(float(body_atr), 3),
+        "ema_reclaimed": ema_reclaimed,
+        "ema_near": ema_near,
+        "oscillator_ok": oscillator_ok,
+        "close": close,
+        "rsi": round(float(rsi), 2),
+    }
+
+
+def _reversal_momentum_context(side, confirm_df, entry_df, smc_ok):
+    enabled = bool(getattr(config, "REVERSAL_MOMENTUM_SCORE_ENABLED", True))
+    context = {"enabled": enabled, "ok": False, "score": 0}
+
+    if not enabled:
+        context["reason"] = "REVERSAL_MOMENTUM_DISABLED"
+        return 0, context
+
+    lookback = max(get_config_int("REVERSAL_MOMENTUM_LOOKBACK", 3), 2)
+    min_candles = max(get_config_int("REVERSAL_MOMENTUM_MIN_CANDLES", 2), 1)
+    min_body_atr = get_config_float("REVERSAL_MOMENTUM_MIN_BODY_ATR", 0.20)
+    min_close_position = get_config_float(
+        "REVERSAL_MOMENTUM_MIN_CLOSE_POSITION",
+        0.58
+    )
+    entry = latest_closed(entry_df)
+    confirm = latest_closed(confirm_df)
+    prev_confirm = previous_closed(confirm_df)
+    entry_context = _directional_candle_context(side, entry)
+    confirm_context = _directional_candle_context(side, confirm)
+    entry_data = _closed_data(entry_df, lookback + 1)
+    recent = entry_data.tail(lookback)
+
+    if side == "BUY":
+        direction_count = sum(1 for _, candle in recent.iterrows() if _is_bullish(candle))
+        structure_break = (
+            len(entry_data) > 1 and
+            entry_context["close"] > entry_data.iloc[:-1]["high"].tail(lookback).max()
+        )
+        confirm_shift = (
+            confirm["close"] > prev_confirm["close"] or
+            confirm["rsi"] > prev_confirm["rsi"] or
+            confirm["macd"] > prev_confirm["macd"]
+        )
+    else:
+        direction_count = sum(1 for _, candle in recent.iterrows() if _is_bearish(candle))
+        structure_break = (
+            len(entry_data) > 1 and
+            entry_context["close"] < entry_data.iloc[:-1]["low"].tail(lookback).min()
+        )
+        confirm_shift = (
+            confirm["close"] < prev_confirm["close"] or
+            confirm["rsi"] < prev_confirm["rsi"] or
+            confirm["macd"] < prev_confirm["macd"]
+        )
+
+    score = 0
+    score += 1.0 if entry_context["direction_ok"] else 0
+    score += 1.0 if entry_context["body_atr"] >= min_body_atr else 0
+    score += 0.75 if entry_context["directional_close"] >= min_close_position else 0
+    score += 1.0 if direction_count >= min_candles else 0
+    score += 1.25 if entry_context["ema_reclaimed"] else 0.5 if entry_context["ema_near"] else 0
+    score += 1.0 if structure_break else 0
+    score += 0.75 if entry_context["oscillator_ok"] else 0
+    score += 0.75 if confirm_context["direction_ok"] else 0
+    score += 0.75 if confirm_shift else 0
+    score += 0.75 if confirm_context["ema_reclaimed"] else 0.35 if confirm_context["ema_near"] else 0
+    score += 0.5 if smc_ok else 0
+    score = round(float(score), 2)
+
+    ok = (
+        score >= get_config_float("REVERSAL_MOMENTUM_MIN_SCORE", 4.0)
+        and entry_context["direction_ok"]
+        and (
+            entry_context["ema_near"] or
+            structure_break or
+            smc_ok
+        )
+        and (
+            confirm_context["direction_ok"] or
+            confirm_shift
+        )
+    )
+    context.update({
+        "ok": ok,
+        "score": score,
+        "entry": entry_context,
+        "confirm": confirm_context,
+        "direction_count": direction_count,
+        "min_candles": min_candles,
+        "structure_break": structure_break,
+        "confirm_shift": bool(confirm_shift),
+        "smc_ok": bool(smc_ok),
+    })
+
+    if not ok:
+        context["reason"] = "REVERSAL_MOMENTUM_WEAK"
+
+    return score, context
+
+
 def _reversal_signal_check(
     side,
     trend_df,
@@ -1910,6 +2041,7 @@ def _reversal_signal_check(
     quality_score,
     smc_score,
     smc_context,
+    momentum_context,
     regime_score,
     confidence,
     confirm_ok,
@@ -1923,46 +2055,81 @@ def _reversal_signal_check(
     failures = []
     counter_ok, counter_context = _counter_trend_context(side, trend_df, confirm_df)
     smc_ok, smc_details = _reversal_smc_check(smc_score, smc_context)
+    momentum_context = momentum_context or {}
+    momentum_ok = bool(momentum_context.get("ok"))
     context.update({
         "counter_trend": counter_context,
         "smc": smc_details,
+        "momentum": momentum_context,
     })
 
     if getattr(config, "REVERSAL_REQUIRE_COUNTER_TREND", True) and not counter_ok:
         failures.append("COUNTER_TREND_CONTEXT_MISSING")
 
-    if getattr(config, "REVERSAL_REQUIRE_SMC", True) and not smc_ok:
+    if (
+        getattr(config, "REVERSAL_REQUIRE_SMC", True)
+        and not smc_ok
+        and not momentum_ok
+    ):
         failures.append("SMC_REVERSAL_EVIDENCE_MISSING")
+
+    confidence_threshold = get_config_float("REVERSAL_SIGNAL_THRESHOLD", 78)
+    confirm_min = get_config_float("REVERSAL_MIN_CONFIRM_SCORE", 8)
+    entry_min = get_config_float("REVERSAL_MIN_ENTRY_SCORE", 5)
+    quality_min = get_config_float("REVERSAL_MIN_QUALITY_SCORE", 0.75)
+    regime_min = get_config_float("REVERSAL_MIN_REGIME_SCORE", -1.0)
+
+    if momentum_ok:
+        confidence_threshold = get_config_float(
+            "REVERSAL_MOMENTUM_SIGNAL_THRESHOLD",
+            confidence_threshold
+        )
+        confirm_min = get_config_float(
+            "REVERSAL_MOMENTUM_MIN_CONFIRM_SCORE",
+            confirm_min
+        )
+        entry_min = get_config_float(
+            "REVERSAL_MOMENTUM_MIN_ENTRY_SCORE",
+            entry_min
+        )
+        quality_min = get_config_float(
+            "REVERSAL_MOMENTUM_MIN_QUALITY_SCORE",
+            quality_min
+        )
+        regime_min = get_config_float(
+            "REVERSAL_MOMENTUM_MIN_REGIME_SCORE",
+            regime_min
+        )
 
     checks = (
         (
             "CONFIDENCE",
             confidence,
-            get_config_float("REVERSAL_SIGNAL_THRESHOLD", 78),
+            confidence_threshold,
             ">="
         ),
         (
             "CONFIRM",
             confirm_score,
-            get_config_float("REVERSAL_MIN_CONFIRM_SCORE", 8),
+            confirm_min,
             ">="
         ),
         (
             "ENTRY",
             entry_score,
-            get_config_float("REVERSAL_MIN_ENTRY_SCORE", 5),
+            entry_min,
             ">="
         ),
         (
             "QUALITY",
             quality_score,
-            get_config_float("REVERSAL_MIN_QUALITY_SCORE", 0.75),
+            quality_min,
             ">="
         ),
         (
             "REGIME",
             regime_score,
-            get_config_float("REVERSAL_MIN_REGIME_SCORE", -1.0),
+            regime_min,
             ">="
         ),
         (
@@ -1982,10 +2149,10 @@ def _reversal_signal_check(
         elif operator == "<=" and value > limit:
             failures.append(f"{label}={round(value, 2)} > {limit}")
 
-    if not confirm_ok:
+    if not confirm_ok and not momentum_ok:
         failures.append("CONFIRMATION_HARD_CHECK_FAILED")
 
-    if not entry_ok:
+    if not entry_ok and not momentum_ok:
         failures.append("ENTRY_HARD_CHECK_FAILED")
 
     if not level_ok:
@@ -2017,6 +2184,13 @@ def _side_signal_score(
     btc_score = _btc_context_score(side, btc_trend, btc_corr, rs)
     participation_score = _futures_participation_score(side, participation)
     smc_score, smc_context = _smc_context_score(side, trend_df, confirm_df, entry_df)
+    smc_ok, _ = _reversal_smc_check(smc_score, smc_context)
+    momentum_score, momentum_context = _reversal_momentum_context(
+        side,
+        confirm_df,
+        entry_df,
+        smc_ok
+    )
     regime_score, regime_context = _market_regime_score(
         side,
         trend_df,
@@ -2045,6 +2219,7 @@ def _side_signal_score(
         btc_score +
         level_score +
         smc_score +
+        momentum_score +
         participation_score +
         regime_score
     )
@@ -2071,6 +2246,7 @@ def _side_signal_score(
         quality_score,
         smc_score,
         smc_context,
+        momentum_context,
         regime_score,
         reversal_confidence,
         confirm_ok,
@@ -2102,6 +2278,8 @@ def _side_signal_score(
         "level_score": level_score,
         "smc_score": smc_score,
         "smc_context": smc_context,
+        "momentum_score": momentum_score,
+        "momentum_context": momentum_context,
         "quality_score": quality_score,
         "confirm_quality": confirm_quality,
         "entry_quality": entry_quality,
@@ -2125,22 +2303,72 @@ def _side_signal_score(
     }
 
 
-def _select_signal(buy, sell):
-    threshold = config.LONG_TERM_SIGNAL_THRESHOLD
-    min_edge = config.LONG_TERM_MIN_SIGNAL_EDGE
+def _signal_threshold(side_data):
+    if side_data.get("confirmation_type") != "REVERSAL":
+        return config.LONG_TERM_SIGNAL_THRESHOLD
 
-    if (
-        buy["hard_ok"]
-        and buy["confidence"] >= threshold
-        and buy["confidence"] >= sell["confidence"] + min_edge
-    ):
+    momentum = side_data.get("reversal_context", {}).get("momentum", {})
+
+    if momentum.get("ok"):
+        return get_config_float(
+            "REVERSAL_MOMENTUM_SIGNAL_THRESHOLD",
+            get_config_float("REVERSAL_SIGNAL_THRESHOLD", 78)
+        )
+
+    return get_config_float(
+        "REVERSAL_SIGNAL_THRESHOLD",
+        config.LONG_TERM_SIGNAL_THRESHOLD
+    )
+
+
+def _signal_edge(side_data):
+    if side_data.get("confirmation_type") == "REVERSAL":
+        return get_config_float("REVERSAL_MIN_SIGNAL_EDGE", 0)
+
+    return config.LONG_TERM_MIN_SIGNAL_EDGE
+
+
+def _signal_candidate(side_data):
+    return (
+        side_data.get("hard_ok")
+        and side_data.get("confidence", 0) >= _signal_threshold(side_data)
+    )
+
+
+def _select_signal(buy, sell):
+    buy_ok = _signal_candidate(buy)
+    sell_ok = _signal_candidate(sell)
+
+    if buy_ok and not sell_ok:
         return "BUY"
 
-    if (
-        sell["hard_ok"]
-        and sell["confidence"] >= threshold
-        and sell["confidence"] >= buy["confidence"] + min_edge
-    ):
+    if sell_ok and not buy_ok:
+        return "SELL"
+
+    if not buy_ok and not sell_ok:
+        return None
+
+    ignore_trend_confidence = bool(
+        getattr(config, "REVERSAL_IGNORE_OPPOSITE_TREND_CONFIDENCE", True)
+    )
+
+    if ignore_trend_confidence:
+        if (
+            buy.get("confirmation_type") == "REVERSAL"
+            and sell.get("confirmation_type") == "TREND"
+        ):
+            return "BUY"
+
+        if (
+            sell.get("confirmation_type") == "REVERSAL"
+            and buy.get("confirmation_type") == "TREND"
+        ):
+            return "SELL"
+
+    if buy["confidence"] >= sell["confidence"] + _signal_edge(buy):
+        return "BUY"
+
+    if sell["confidence"] >= buy["confidence"] + _signal_edge(sell):
         return "SELL"
 
     return None
@@ -2159,6 +2387,7 @@ def log_signal_analysis(analysis):
         f"regime={buy.get('regime_context', {}).get('regime', '')}:"
         f"{buy.get('regime_score', 0)} "
         f"smc={buy.get('smc_score', 0)} "
+        f"momentum={buy.get('momentum_score', 0)} "
         f"futures={buy.get('participation_score', 0)} | "
         f"SELL conf={sell.get('confidence', 0)}% "
         f"hard={sell.get('hard_ok', False)} "
@@ -2169,6 +2398,7 @@ def log_signal_analysis(analysis):
         f"regime={sell.get('regime_context', {}).get('regime', '')}:"
         f"{sell.get('regime_score', 0)} "
         f"smc={sell.get('smc_score', 0)} "
+        f"momentum={sell.get('momentum_score', 0)} "
         f"futures={sell.get('participation_score', 0)}"
     )
 
@@ -2177,6 +2407,7 @@ def log_signal_analysis(analysis):
             "BUY REVERSAL CONFIRMED | " +
             f"counter={buy.get('reversal_context', {}).get('counter_trend', {}).get('count')} "
             f"smc={buy.get('smc_score', 0)} "
+            f"momentum={buy.get('momentum_score', 0)} "
             f"conf={buy.get('confidence', 0)}"
         )
 
@@ -2185,7 +2416,34 @@ def log_signal_analysis(analysis):
             "SELL REVERSAL CONFIRMED | " +
             f"counter={sell.get('reversal_context', {}).get('counter_trend', {}).get('count')} "
             f"smc={sell.get('smc_score', 0)} "
+            f"momentum={sell.get('momentum_score', 0)} "
             f"conf={sell.get('confidence', 0)}"
+        )
+
+    min_blocked_conf = get_config_float("REVERSAL_LOG_BLOCKED_MIN_CONFIDENCE", 55)
+
+    if (
+        getattr(config, "REVERSAL_MODE_ENABLED", True)
+        and not buy.get("reversal_ok")
+        and buy.get("reversal_confidence", 0) >= min_blocked_conf
+    ):
+        momentum = buy.get("momentum_context", {})
+        log_info(
+            "BUY REVERSAL BLOCKED | " +
+            "; ".join(buy.get("reversal_reasons", [])) +
+            f" | momentum={momentum.get('score', 0)} ok={momentum.get('ok')}"
+        )
+
+    if (
+        getattr(config, "REVERSAL_MODE_ENABLED", True)
+        and not sell.get("reversal_ok")
+        and sell.get("reversal_confidence", 0) >= min_blocked_conf
+    ):
+        momentum = sell.get("momentum_context", {})
+        log_info(
+            "SELL REVERSAL BLOCKED | " +
+            "; ".join(sell.get("reversal_reasons", [])) +
+            f" | momentum={momentum.get('score', 0)} ok={momentum.get('ok')}"
         )
 
     if not buy.get("module_gates_ok", True) and not buy.get("reversal_ok"):
@@ -2311,11 +2569,32 @@ def should_fetch_futures_context(analysis):
     best = analysis.get(best_key, {}) if best_key in ("buy", "sell") else {}
 
     if best:
+        momentum = best.get("momentum_context", {})
         return bool(
             best.get("level_ok") and
-            best.get("trend_ok") and
-            best.get("confirm_ok") and
-            best.get("entry_ok")
+            (
+                best.get("hard_ok") or
+                (
+                    best.get("reversal_confidence", 0) >=
+                    get_config_float("FUTURES_CONTEXT_MIN_CONFIDENCE", 60)
+                    and (
+                        best.get("reversal_ok") or
+                        momentum.get("ok")
+                    )
+                )
+            ) and
+            (
+                best.get("trend_ok") or
+                best.get("reversal_context", {}).get("counter_trend", {}).get("count", 0) >= 2
+            ) and
+            (
+                best.get("confirm_ok") or
+                momentum.get("ok")
+            ) and
+            (
+                best.get("entry_ok") or
+                momentum.get("ok")
+            )
         )
 
     return bool(

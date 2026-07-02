@@ -1776,6 +1776,73 @@ def calculate_signal_rank(candidate):
     return round(rank, 2)
 
 
+def get_candidate_signal_type(candidate):
+    signal = candidate.get("signal")
+    analysis = candidate.get("analysis") or {}
+    side_data = analysis.get((signal or "").lower(), {}) or {}
+    return str(side_data.get("confirmation_type") or "").upper()
+
+
+def effective_position_limit(base_limit, reversal_extra, reversal_signal):
+    if not reversal_signal:
+        return base_limit
+
+    extra = max(int(reversal_extra or 0), 0)
+
+    if extra <= 0:
+        return base_limit
+
+    return (int(base_limit) if base_limit else 0) + extra
+
+
+def check_entry_position_limits(signal, signal_type, counts):
+    reversal_signal = signal_type == "REVERSAL"
+    total_limit = effective_position_limit(
+        config.MAX_TOTAL_POSITIONS,
+        getattr(config, "REVERSAL_EXTRA_TOTAL_POSITIONS", 0),
+        reversal_signal
+    )
+    buy_limit = effective_position_limit(
+        config.MAX_BUY_POSITIONS,
+        getattr(config, "REVERSAL_EXTRA_BUY_POSITIONS", 0),
+        reversal_signal
+    )
+    sell_limit = effective_position_limit(
+        config.MAX_SELL_POSITIONS,
+        getattr(config, "REVERSAL_EXTRA_SELL_POSITIONS", 0),
+        reversal_signal
+    )
+    label = "REVERSAL" if reversal_signal else "NORMAL"
+
+    if total_limit and counts["total"] >= total_limit:
+        return False, (
+            f"{label} MAX POSITIONS REACHED | "
+            f"TOTAL={counts['total']}/{total_limit} | "
+            f"BUY={counts['buy']} | SELL={counts['sell']}"
+        )
+
+    if signal == "BUY" and buy_limit and counts["buy"] >= buy_limit:
+        return False, (
+            f"{label} MAX BUY POSITIONS REACHED | "
+            f"BUY={counts['buy']}/{buy_limit} | TOTAL={counts['total']}"
+        )
+
+    if signal == "SELL" and sell_limit and counts["sell"] >= sell_limit:
+        return False, (
+            f"{label} MAX SELL POSITIONS REACHED | "
+            f"SELL={counts['sell']}/{sell_limit} | TOTAL={counts['total']}"
+        )
+
+    if reversal_signal:
+        log_info(
+            f"REVERSAL LIMIT OK | TOTAL={counts['total']}/{total_limit or 'NA'} | "
+            f"BUY={counts['buy']}/{buy_limit or 'NA'} | "
+            f"SELL={counts['sell']}/{sell_limit or 'NA'}"
+        )
+
+    return True, ""
+
+
 def build_entry_candidate(
     symbol,
     signal,
@@ -1828,6 +1895,7 @@ def execute_entry_candidate(
     rs = candidate["rs"]
     news_context = candidate["news_context"]
     llm_context = candidate["llm_context"]
+    signal_type = get_candidate_signal_type(candidate)
 
     try:
         if shutdown_event.is_set():
@@ -1863,36 +1931,14 @@ def execute_entry_candidate(
             f"TOTAL={counts['total']} | BUY={counts['buy']} | SELL={counts['sell']}"
         )
 
-        if config.MAX_TOTAL_POSITIONS and counts["total"] >= config.MAX_TOTAL_POSITIONS:
-            log_warning(
-                f"MAX POSITIONS REACHED | "
-                f"TOTAL={counts['total']}/{config.MAX_TOTAL_POSITIONS} | "
-                f"BUY={counts['buy']} | SELL={counts['sell']}"
-            )
-            return position_details, open_positions, False
+        limit_ok, limit_reason = check_entry_position_limits(
+            signal,
+            signal_type,
+            counts
+        )
 
-        if (
-            signal == "BUY"
-            and config.MAX_BUY_POSITIONS
-            and counts["buy"] >= config.MAX_BUY_POSITIONS
-        ):
-            log_warning(
-                f"MAX BUY POSITIONS REACHED | "
-                f"BUY={counts['buy']}/{config.MAX_BUY_POSITIONS} | "
-                f"TOTAL={counts['total']}"
-            )
-            return position_details, open_positions, False
-
-        if (
-            signal == "SELL"
-            and config.MAX_SELL_POSITIONS
-            and counts["sell"] >= config.MAX_SELL_POSITIONS
-        ):
-            log_warning(
-                f"MAX SELL POSITIONS REACHED | "
-                f"SELL={counts['sell']}/{config.MAX_SELL_POSITIONS} | "
-                f"TOTAL={counts['total']}"
-            )
+        if not limit_ok:
+            log_warning(limit_reason)
             return position_details, open_positions, False
 
         current_price = entry_df["close"].iloc[-2]
@@ -2163,6 +2209,8 @@ def execute_entry_candidate(
             reference_price,
             level_info
         )
+        position_state["signal_type"] = signal_type or "UNKNOWN"
+        position_state["confirmation_type"] = signal_type or "UNKNOWN"
         position_state["tp_status"] = "CREATED" if protection_ok else "FAILED"
         position_state["tp_price"] = protection_result.get("tp_price")
         position_state["tp_mode"] = protection_result.get("tp_mode")
